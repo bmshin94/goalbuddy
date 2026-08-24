@@ -6,7 +6,7 @@ Dates are public npm publication dates. Historical entries describe the product 
 
 Release history must describe product behavior with anonymized evidence. Never include client, customer, company, donor, or private project names. Public contributor handles may appear only for attribution.
 
-## Unreleased
+## 0.4.4: Installer Integrity (2026-08-24)
 
 - **Published content must match its release tag.** The release workflow now compares the extracted npm package and exact Git tag by packaged file path and SHA-256 hash before publication, then repeats the same registry-versus-tag check after publication. This would reject the known 0.4.2 mismatch while accepting 0.4.3.
 - **Installer success now means proven final state.** Install, update, doctor, and reset retain their existing JSON fields and add one shared result contract with the selected install model, exact installed path and version, proof checks, fallback reason, warnings, and a structured error. Multi-target commands fail when either requested target is unproven.

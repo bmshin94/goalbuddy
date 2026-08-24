@@ -2439,22 +2439,20 @@ function printInstallReport(report) {
 }
 
 function printEverywhereInstallReport(report) {
-  const verb = report.command === "update" ? "Updated" : "Installed";
+  const action = report.command === "update" ? "update" : "install";
   console.log("");
-  console.log(`${verb} ${canonicalProductName} for Codex and Claude Code ${report.package.current_version}`);
+  console.log(`${canonicalProductName} ${action} for Codex and Claude Code ${report.package.current_version}`);
   console.log("");
 
-  if (report.codex?.ok === false) {
-    console.log(`Codex: not completed (${report.codex.error})`);
-  } else if (report.codex) {
+  if (report.codex?.result?.ok === true) {
     console.log(`Codex: plugin ${report.codex.version} enabled at ${report.codex.cache_path}`);
+  } else if (report.codex) {
+    console.log(`Codex: not completed (${report.codex.result?.error?.message || report.codex.error || "unproven state"})`);
   }
 
-  if (report.claude?.ok === false) {
-    console.log(`Claude Code: not completed (${report.claude.error})`);
-  } else if (report.claude?.result?.install_model === "claude-cli") {
+  if (report.claude?.result?.ok === true && report.claude.result.install_model === "claude-cli") {
     console.log(`Claude Code: plugin ${report.claude.result.installed_version} installed at ${report.claude.result.installed_path}`);
-  } else if (report.claude?.skill) {
+  } else if (report.claude?.result?.ok === true && report.claude.skill) {
     console.log(`Claude Code: skill ${report.claude.skill.status} at ${report.claude.skill.path}`);
     console.log(`Claude Code agents: ${summarizeStatuses(report.claude.agents)}`);
     console.log(`Claude Code command: /goalbuddy ${report.claude.goal_command.status} at ${report.claude.goal_command.path}`);
@@ -2475,10 +2473,14 @@ function printEverywhereInstallReport(report) {
     for (const error of report.errors) console.log(`  ${error.target}: ${error.error}`);
   }
 
-  console.log("");
-  console.log("Next:");
-  console.log(`  Restart Codex, then use: $${canonicalSkillName}`);
-  console.log("  Restart Claude Code, then run: /goal-prep");
+  const codexReady = report.codex?.result?.ok === true;
+  const claudeReady = report.claude?.result?.ok === true;
+  if (codexReady || claudeReady) {
+    console.log("");
+    console.log("Next:");
+    if (codexReady) console.log(`  Restart Codex, then use: $${canonicalSkillName}`);
+    if (claudeReady) console.log("  Restart Claude Code, then run: /goal-prep");
+  }
 }
 
 function summarizeStatuses(items) {

@@ -18,6 +18,15 @@ function run(args, env) {
   return { status: result.status, stdout: result.stdout, stderr: result.stderr, json: result.stdout ? JSON.parse(result.stdout) : null };
 }
 
+function runHuman(args, env) {
+  const result = spawnSync(process.execPath, [cli, ...args], {
+    cwd: packageRoot,
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
 function writeExecutable(path, lines) {
   writeFileSync(path, `${lines.join("\n")}\n`);
   chmodSync(path, 0o755);
@@ -182,6 +191,37 @@ test("non-directory Codex and Claude homes fail with the shared result contract"
     const claude = run(["install", "--target", "claude", "--claude-home", file], missingCliEnv(root, "claude"));
     assert.equal(claude.status, 1);
     assertResult(claude.json.result, { action: "install", target: "claude", model: "none", ok: false });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("aggregate failed targets never receive human success or next-step copy", () => {
+  const root = mkdtempSync(join(tmpdir(), "goalbuddy-aggregate-copy-"));
+  try {
+    const invalidCodex = join(root, "codex-file");
+    const invalidClaude = join(root, "claude-file");
+    writeFileSync(invalidCodex, "user data\n");
+    writeFileSync(invalidClaude, "user data\n");
+    for (const action of ["install", "update"]) {
+      const args = [action, "--codex-home", invalidCodex, "--claude-home", invalidClaude];
+      const human = runHuman(args, {});
+      assert.equal(human.status, 1, human.stderr || human.stdout);
+      assert.match(human.stdout, /Codex: not completed/);
+      assert.match(human.stdout, /Claude Code: not completed/);
+      assert.doesNotMatch(human.stdout, /\b(?:enabled|installed|updated|restart)\b/i);
+      assert.doesNotMatch(human.stdout, /then (?:use|run):/i);
+      assert.doesNotMatch(human.stdout, /^Next:$/m);
+
+      const json = run(args, {});
+      assert.equal(json.status, 1, json.stderr || json.stdout);
+      assert.equal(json.json.ok, false);
+      for (const target of [json.json.codex, json.json.claude]) {
+        assert.equal(target.result.ok, false);
+        assert.equal(typeof target.result.error.code, "string");
+        assert.equal(typeof target.result.error.message, "string");
+      }
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
