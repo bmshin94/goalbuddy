@@ -9,6 +9,7 @@ Release history must describe product behavior with anonymized evidence. Never i
 ## Unreleased
 
 - **The Codex plugin can be uninstalled from the plugin catalog again.** The marketplace entry declared `INSTALLED_BY_DEFAULT`, which Codex reads as admin-managed: the catalog labelled GoalBuddy "Installed by admin" and replaced its uninstall action with a disabled row. GoalBuddy is user-installed, so the entry now declares `AVAILABLE`.
+- **A downgrade no longer keeps the newer Codex plugin live.** Install removed only the version directory it was about to write, but Codex serves the highest version directory it finds under the plugin cache, so a directory left behind by a newer install kept being served. Install now prunes stale sibling version directories the way Codex's own installer does, and leaves directories that are not valid version segments alone.
 
 ## 0.4.3: Restore Claude's Native `/goal` (2026-08-05)
 
