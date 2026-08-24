@@ -18,3 +18,10 @@ test("npm publishing uses OIDC and a trusted-publishing-capable npm", () => {
   assert.match(workflow, /npm install --global npm@11\.18\.0/);
   assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN/);
 });
+
+test("npm publishing checks packaged content against the exact release tag", () => {
+  assert.match(workflow, /fetch-depth: 0/);
+  assert.match(workflow, /check-package-identity\.mjs --package \. --git-ref "\$RELEASE_TAG"/);
+  assert.match(workflow, /check-package-identity\.mjs --package "goalbuddy@\$package_version" --git-ref "\$RELEASE_TAG"/);
+  assert.match(workflow, /for attempt in 1 2 3 4 5/);
+});

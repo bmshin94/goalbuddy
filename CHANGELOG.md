@@ -8,6 +8,7 @@ Release history must describe product behavior with anonymized evidence. Never i
 
 ## Unreleased
 
+- **Published content must match its release tag.** The release workflow now compares the extracted npm package and exact Git tag by packaged file path and SHA-256 hash before publication, then repeats the same registry-versus-tag check after publication. This would reject the known 0.4.2 mismatch while accepting 0.4.3.
 - **Installer success now means proven final state.** Install, update, doctor, and reset retain their existing JSON fields and add one shared result contract with the selected install model, exact installed path and version, proof checks, fallback reason, warnings, and a structured error. Multi-target commands fail when either requested target is unproven.
 - **Native paths retain safe fallbacks.** Codex creates its resolved home before probing the CLI and uses an atomic bundled-copy fallback unless the CLI's exact installed state is proven. Claude Code keeps existing loose installs on loose files, prefers its CLI only for clean or existing-plugin homes, and rejects mixed state.
 - **Claude reset is ownership-safe.** Native removal must be proven through the Claude Code CLI. Loose reset removes only byte-matching GoalBuddy files and preserves modified or unproven user files.
