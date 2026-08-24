@@ -95,6 +95,19 @@ npx goalbuddy reset --target codex
 
 Native `codex plugin remove goalbuddy@goalbuddy` only removes the native plugin surface. GoalBuddy also owns the `goal_*.toml` agent files it installed, its Codex plugin cache, its marketplace entry, and old personal skill folders from earlier installs. Use `goalbuddy reset --target codex` when you want those GoalBuddy-owned files removed too.
 
+## Claude Code Install Model
+
+GoalBuddy uses Claude Code's native plugin installer for a clean home when the `claude` CLI can prove the exact bundled version, skill, agents, and `/goalbuddy` command. Existing loose-file installs continue updating in place, and a clean home falls back to the same loose-file layout when the CLI is unavailable. GoalBuddy never mixes the two models automatically; `doctor` reports mixed or incomplete state as a failure.
+
+```bash
+npx goalbuddy doctor --target claude
+npx goalbuddy reset --target claude
+```
+
+Reset removes a native plugin through the Claude Code CLI. For loose installs, it removes only files whose contents still match GoalBuddy's bundled files; modified or unproven files are preserved and reported.
+
+Installer JSON remains backward compatible and now includes a `result` object for each requested target. Its `ok` value comes from final filesystem and configuration readback, so a CLI exit code or metadata record by itself is never reported as a completed install.
+
 ## What It Creates
 
 ```text

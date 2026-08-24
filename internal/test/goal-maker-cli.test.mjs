@@ -24,6 +24,9 @@ function runGoalMaker(args, options = {}) {
 function testEnv(env) {
   const result = { ...env };
   delete result.GITHUB_TOKEN;
+  if (result.GOALBUDDY_TEST_DISABLE_CLAUDE_CLI === undefined) {
+    result.GOALBUDDY_TEST_DISABLE_CLAUDE_CLI = "1";
+  }
   return result;
 }
 

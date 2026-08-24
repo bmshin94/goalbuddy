@@ -8,6 +8,9 @@ Release history must describe product behavior with anonymized evidence. Never i
 
 ## Unreleased
 
+- **Installer success now means proven final state.** Install, update, doctor, and reset retain their existing JSON fields and add one shared result contract with the selected install model, exact installed path and version, proof checks, fallback reason, warnings, and a structured error. Multi-target commands fail when either requested target is unproven.
+- **Native paths retain safe fallbacks.** Codex creates its resolved home before probing the CLI and uses an atomic bundled-copy fallback unless the CLI's exact installed state is proven. Claude Code keeps existing loose installs on loose files, prefers its CLI only for clean or existing-plugin homes, and rejects mixed state.
+- **Claude reset is ownership-safe.** Native removal must be proven through the Claude Code CLI. Loose reset removes only byte-matching GoalBuddy files and preserves modified or unproven user files.
 - **The Codex plugin can be uninstalled from the plugin catalog again.** The marketplace entry declared `INSTALLED_BY_DEFAULT`, which Codex reads as admin-managed: the catalog labelled GoalBuddy "Installed by admin" and replaced its uninstall action with a disabled row. GoalBuddy is user-installed, so the entry now declares `AVAILABLE`.
 - **A downgrade no longer keeps the newer Codex plugin live.** Install removed only the version directory it was about to write, but Codex serves the highest version directory it finds under the plugin cache, so a directory left behind by a newer install kept being served. Install now prunes stale sibling version directories the way Codex's own installer does, and leaves directories that are not valid version segments alone.
 
