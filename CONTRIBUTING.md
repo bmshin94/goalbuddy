@@ -7,7 +7,7 @@ Thanks for improving `goalbuddy`.
 Clone the repo and run the checks:
 
 ```bash
-git clone https://github.com/tolibear/goalbuddy.git
+git clone https://github.com/tolimarchuk/goalbuddy.git
 cd goalbuddy
 npm run check
 ```

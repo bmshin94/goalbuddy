@@ -2,7 +2,7 @@
 
 GitHub Pages is configured for:
 
-- Repository: `tolibear/goalbuddy`
+- Repository: `tolimarchuk/goalbuddy`
 - Pages build type: GitHub Actions workflow
 - Custom domain: `goalbuddy.dev`
 - Published artifact path: `internal/site`
@@ -32,7 +32,7 @@ Recommended `www` redirect support:
 
 ```text
 Type   Name  Content
-CNAME  www   tolibear.github.io
+CNAME  www   tolimarchuk.github.io
 ```
 
 After DNS resolves, re-check:

@@ -102,7 +102,7 @@ async function loadGithubStars() {
   if (!starCount) return;
 
   try {
-    const response = await fetch("https://api.github.com/repos/tolibear/goalbuddy", {
+    const response = await fetch("https://api.github.com/repos/tolimarchuk/goalbuddy", {
       headers: { Accept: "application/vnd.github+json" },
     });
     if (!response.ok) throw new Error("GitHub API unavailable");

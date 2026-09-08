@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "goalbuddy",
   "owner": {
-    "name": "tolibear",
+    "name": "tolimarchuk",
     "email": "support@tolibear.com"
   },
   "description": "GoalBuddy /goal-prep skill plus Scout/Judge/Worker subagents for pressured /goal runs.",

@@ -13,7 +13,7 @@ GoalBuddy publishes the `goalbuddy` npm package from GitHub Actions using npm tr
 Configure this on npmjs.com for the `goalbuddy` package:
 
 - Publisher: GitHub Actions
-- GitHub owner/user: `tolibear`
+- GitHub owner/user: `tolimarchuk`
 - Repository: `goalbuddy`
 - Workflow filename: `npm-publish.yml`
 - Package: `goalbuddy`
@@ -28,7 +28,7 @@ Or configure the same trust relationship from the npm CLI:
 
 ```bash
 npx --yes npm@^11.15.0 trust github goalbuddy \
-  --repo tolibear/goalbuddy \
+  --repo tolimarchuk/goalbuddy \
   --file npm-publish.yml \
   --allow-publish \
   --yes

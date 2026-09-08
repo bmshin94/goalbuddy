@@ -25,7 +25,7 @@ test("GoalBuddy plugin is exposed through a Codex marketplace manifest", () => {
 
 test("GoalBuddy plugin is exposed through a Claude marketplace manifest", () => {
   assert.equal(claudeMarketplace.name, "goalbuddy");
-  assert.equal(claudeMarketplace.owner.name, "tolibear");
+  assert.equal(claudeMarketplace.owner.name, "tolimarchuk");
   assert.equal(claudeMarketplace.plugins.length, 1);
 
   const [entry] = claudeMarketplace.plugins;
@@ -37,7 +37,7 @@ test("GoalBuddy plugin is exposed through a Claude marketplace manifest", () => 
 test("GoalBuddy plugin metadata tracks the package release", () => {
   assert.equal(plugin.name, pkg.name);
   assert.equal(plugin.version, pkg.version);
-  assert.equal(plugin.repository, "https://github.com/tolibear/goalbuddy");
+  assert.equal(plugin.repository, "https://github.com/tolimarchuk/goalbuddy");
   assert.equal(plugin.skills, "./skills/");
 });
 

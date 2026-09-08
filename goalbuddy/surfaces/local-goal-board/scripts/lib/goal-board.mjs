@@ -783,7 +783,7 @@ function boardHtml() {
       </nav>
     </div>
     <div class="header-tools">
-      <a class="github-stars" href="https://github.com/tolibear/goalbuddy" target="_blank" rel="noreferrer" aria-label="Open GoalBuddy on GitHub">
+      <a class="github-stars" href="https://github.com/tolimarchuk/goalbuddy" target="_blank" rel="noreferrer" aria-label="Open GoalBuddy on GitHub">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2.8 2.84 5.76 6.36.92-4.6 4.48 1.08 6.34L12 17.32 6.32 20.3l1.08-6.34-4.6-4.48 6.36-.92L12 2.8Z"></path></svg>
         <span id="github-stars">Stars</span>
       </a>
@@ -2069,7 +2069,7 @@ function formatStars(count) {
 async function loadGithubStars() {
   if (!githubStarsEl) return;
   try {
-    const response = await fetch("https://api.github.com/repos/tolibear/goalbuddy", {
+    const response = await fetch("https://api.github.com/repos/tolimarchuk/goalbuddy", {
       headers: { Accept: "application/vnd.github+json" },
     });
     if (!response.ok) throw new Error("GitHub API unavailable");

@@ -191,7 +191,7 @@ Multiple local boards reuse one readable `goalbuddy.localhost` hub with an in-he
 
 Custom external integrations should be built as ordinary repo work with a concrete implementation plan, not installed from a GoalBuddy catalog.
 
-See the [running changelog](CHANGELOG.md) for the complete release history. The latest published snapshot is [GoalBuddy 0.4.3: Restore Claude's Native /goal](https://github.com/tolibear/goalbuddy/releases/tag/v0.4.3).
+See the [running changelog](CHANGELOG.md) for the complete release history. The latest published snapshot is [GoalBuddy 0.4.3: Restore Claude's Native /goal](https://github.com/tolimarchuk/goalbuddy/releases/tag/v0.4.3).
 
 <p align="center">
   <img src="internal/assets/goalbuddy-live-board.jpg" alt="GoalBuddy local live board open next to Codex while Scout, Judge, and Worker tasks populate." width="100%">
@@ -215,11 +215,11 @@ For release process details, see [docs/releases](docs/releases/README.md).
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=tolibear%2Fgoalbuddy&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=tolimarchuk%2Fgoalbuddy&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=tolibear/goalbuddy&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=tolibear/goalbuddy&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=tolibear/goalbuddy&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=tolimarchuk/goalbuddy&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=tolimarchuk/goalbuddy&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=tolimarchuk/goalbuddy&type=date&legend=top-left" />
  </picture>
 </a>
 

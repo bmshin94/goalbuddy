@@ -336,7 +336,7 @@ test("writes a minimal GoalBuddy web app into the goal directory", () => {
   assert.match(js, /new EventSource\("\.\/events"\)/);
   assert.match(js, /fetch\("\.\.\/api\/boards"/);
   assert.match(js, /fetch\("\.\.\/api\/settings"/);
-  assert.match(js, /fetch\("https:\/\/api\.github\.com\/repos\/tolibear\/goalbuddy"/);
+  assert.match(js, /fetch\("https:\/\/api\.github\.com\/repos\/tolimarchuk\/goalbuddy"/);
   assert.match(js, /goalbuddy\.localBoardSettings\.v1/);
   assert.match(js, /document\.documentElement\.dataset\.theme/);
   assert.match(js, /rememberCurrentBoard/);

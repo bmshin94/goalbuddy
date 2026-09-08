@@ -66,4 +66,4 @@ node internal/cli/goal-maker.mjs board docs/goals/<slug> --once --json
 
 ## Release Notes
 
-The plugin is prepared for the `tolibear/goalbuddy` repo and `goalbuddy` npm package. Keep `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json` aligned with `package.json` before publishing a new package release.
+The plugin is prepared for the `tolimarchuk/goalbuddy` repo and `goalbuddy` npm package. Keep `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json` aligned with `package.json` before publishing a new package release.

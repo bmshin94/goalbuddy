@@ -970,7 +970,7 @@ test("reset removes only GoalBuddy-owned Codex runtime surfaces", () => {
       "enabled = true",
       "",
       "[marketplaces.goalbuddy]",
-      'source = "tolibear/goalbuddy"',
+      'source = "tolimarchuk/goalbuddy"',
       'source_type = "git"',
       "",
       "[marketplaces.goalbuddy.settings]",

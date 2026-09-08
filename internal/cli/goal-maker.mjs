@@ -30,7 +30,7 @@ const legacyClaudeGoalCommandHashes = new Set([
 ]);
 const skillSource = join(packageRoot, canonicalSkillDirectory);
 const claudePluginSource = join(packageRoot, "plugins", "goalbuddy");
-const defaultMarketplaceSource = "tolibear/goalbuddy";
+const defaultMarketplaceSource = "tolimarchuk/goalbuddy";
 const packageInfo = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 const defaultCodexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
 const defaultClaudeHome = process.env.CLAUDE_HOME || process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
@@ -1446,7 +1446,7 @@ Usage:
   ${canonicalCliName} plugin install [--source <marketplace-source>] [--codex-home <path>] [--json]
 
 Default source:
-  tolibear/goalbuddy
+  tolimarchuk/goalbuddy
 `);
 }
 
