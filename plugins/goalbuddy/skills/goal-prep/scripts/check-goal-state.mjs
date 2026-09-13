@@ -3,6 +3,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve, sep } from "node:path";
 
+import { sha256 } from "./file-snapshot.mjs";
+
 const inputPath = process.argv[2];
 const isChildCheck = process.argv.includes("--child");
 
@@ -656,6 +658,7 @@ function escapeRegExp(value) {
 }
 
 if (goalStatus === "done") {
+  warnings.push("Structural validity is not acceptance proof. Run check-can-stop.mjs for the current outcome/artifact acceptance gate; legacy audit claims alone cannot authorize completion.");
   if (noCompletionOnWeakProof && (isWeakProof(completionProof) || isWeakProof(oracleSignal) || isWeakProof(oracleFinalProof))) {
     errors.push("done goals require concrete completion proof, goal.oracle.signal, and goal.oracle.final_proof; weak proof cannot close a goal");
   }
@@ -686,6 +689,7 @@ const result = {
   ok: errors.length === 0,
   version,
   state_path: statePath,
+  state_sha256: sha256(text),
   goal_status: goalStatus,
   active_task: activeTask,
   agent_statuses: Object.fromEntries(agentStatuses.map(({ agent, status }) => [agent, status])),

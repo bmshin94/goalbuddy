@@ -2,9 +2,15 @@
 // Dispatch one board task to an external harness CLI and verify the result.
 // Read-only toward state.yaml: prints the receipt and scope verdict; the PM records them.
 import { spawnSync } from "node:child_process";
-import { relative, resolve, sep } from "node:path";
+import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatPrompt, loadBoard, renderTaskPrompt, resolveBoardPath, selectTask } from "./render-task-prompt.mjs";
+import { gitSnapshot, goalControlPaths, insidePath, matchesPattern, portable } from "./file-snapshot.mjs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+
+import { DuplicateKeyError, parseBoard, parseJson } from "./strict-data.mjs";
+import { taskAuthority, validateIdentity } from "./receipt-contract.mjs";
+export { matchesPattern } from "./file-snapshot.mjs";
 
 const HARNESSES = new Set(["codex", "claude-code"]);
 const READ_ONLY_ROLES = new Set(["scout", "judge"]);
@@ -54,7 +60,9 @@ export function parseDispatchArgs(args) {
 }
 
 export function dispatchTask(options) {
-  const boardPath = resolveBoardPath({ goalRoot: options.goalRoot });
+  const boardPath = realpathSync(resolveBoardPath({ goalRoot: options.goalRoot }));
+  const boardBytes = readFileSync(boardPath);
+  const document = parseBoard(boardBytes.toString("utf8"));
   const board = loadBoard(boardPath);
   const task = selectTask(board, options.taskId);
   const to = options.to || cleanScalar(task.harness) || "";
@@ -73,10 +81,25 @@ export function dispatchTask(options) {
     `- End your reply with exactly one goalbuddy_receipt_v1 JSON object, including "harness": "${to}".`,
   ].join("\n");
 
-  const before = gitChangedFiles();
+  if (task.harness && task.harness !== to) return failure("Dispatch target contradicts the task harness.", { task_id: task.id });
+  const admitted = [...(task.allowed_files || []), ...(task.inputs || []).filter(path => typeof path === "string" && existsSync(resolve(path))), ...(task.acceptance?.artifacts || []), ...(task.acceptance?.inputs || [])];
+  const before = gitSnapshot(process.cwd(), { boardPath, admitted });
+  if (!before.ok || !insidePath(before.root, realpathSync(boardPath))) {
+    return failure("Cannot establish dispatch scope; harness was not started.", {
+      task_id: task.id, harness: to, role,
+      scope_check: { status: "unverifiable", changed_files: [], violations: [], reason: before.error || "Board is outside the inspected repository." },
+    });
+  }
+  if (!readFileSync(boardPath).equals(boardBytes)) {
+    return failure("Board changed while preparing dispatch; harness was not started. Review the current task and scope before retrying.", {
+      task_id: task.id, harness: to, role,
+      scope_check: { status: "unverifiable", changed_files: [portable(relative(before.root, boardPath))], violations: [] },
+    });
+  }
+  const authority = taskAuthority(document, document.tasks.find(candidate => candidate.id === task.id), boardPath, { harness: to, cwd: process.cwd(), repositoryRoot: before.root });
   const run = runHarness(to, prompt, { model: options.model, sandbox: rendered.payload.metadata.sandbox, role, timeoutSeconds: options.timeoutSeconds });
-  const after = gitChangedFiles();
-  const scope = scopeCheck({ before, after, role, allowedFiles: rendered.payload.task.allowed_files });
+  const after = gitSnapshot(process.cwd(), { boardPath, admitted, previousPaths: before.sourcePaths });
+  const scope = scopeCheck({ before, after, role, allowedFiles: rendered.payload.task.allowed_files, boardPath });
   if (run.error) {
     return failure(run.error, {
       task_id: task.id,
@@ -88,11 +111,18 @@ export function dispatchTask(options) {
     });
   }
 
-  const receipt = extractReceipt(`${run.stdout}\n${run.stderr}`);
-  if (receipt && !receipt.harness) receipt.harness = to;
+  let receipt = null, receiptError = null;
+  try {
+    receipt = extractReceipt(`${run.stdout}\n${run.stderr}`);
+    if (receipt) {
+      validateIdentity(receipt, { taskId: task.id, boardPath, harness: to });
+      receipt = { ...receipt, task_id: task.id, board_path: boardPath, harness: to };
+    }
+  } catch (error) { receiptError = error.message; }
 
   const report = {
-    ok: Boolean(receipt) && scope.status !== "violations" && run.status === 0,
+    ok: Boolean(receipt) && !receiptError && scope.status === "clean" && run.status === 0,
+    dispatch_version: 1, repository_root: before.root, board_path: boardPath, cwd: process.cwd(), authority_sha256: authority,
     harness: to,
     task_id: task.id,
     role,
@@ -100,8 +130,9 @@ export function dispatchTask(options) {
     receipt: receipt || null,
     scope_check: scope,
   };
+  if (receiptError) report.error = receiptError;
   if (!receipt) {
-    report.error = "No goalbuddy_receipt_v1 object found in the harness output.";
+    report.error = receiptError || "No goalbuddy_receipt_v1 object found in the harness output.";
     report.output_tail = `${run.stdout}`.slice(-2000);
   }
   return report;
@@ -118,7 +149,7 @@ function runHarness(to, prompt, { model, sandbox, role, timeoutSeconds }) {
     encoding: "utf8",
     timeout: timeoutSeconds * 1000,
     shell: process.platform === "win32",
-    env: process.env,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
     maxBuffer: 32 * 1024 * 1024,
   });
   if (result.error?.code === "ENOENT") {
@@ -193,8 +224,9 @@ function parseBalancedObject(text, start) {
       depth -= 1;
       if (depth === 0) {
         try {
-          return JSON.parse(text.slice(start, index + 1));
-        } catch {
+          return parseJson(text.slice(start, index + 1));
+        } catch (error) {
+          if (error instanceof DuplicateKeyError) throw error;
           return null;
         }
       }
@@ -209,48 +241,37 @@ function isReceiptShaped(candidate) {
   return ["task_id", "decision", "summary", "changed_files", "evidence"].some((field) => field in candidate);
 }
 
-function gitChangedFiles() {
-  const check = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
-  if (check.status !== 0) return null;
-  const tracked = spawnSync("git", ["diff", "--name-only", "HEAD"], { encoding: "utf8" });
-  const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], { encoding: "utf8" });
-  const files = new Set();
-  for (const output of [tracked.stdout, untracked.stdout]) {
-    for (const line of String(output || "").split("\n")) {
-      if (line.trim()) files.add(line.trim());
-    }
+export function scopeCheck({ before, after, role, allowedFiles, boardPath }) {
+  if (!before?.ok || !after?.ok || before.root !== after.root || before.gitDir !== after.gitDir || before.commonDir !== after.commonDir) {
+    return { status: "unverifiable", changed_files: [], violations: [], reason: before?.error || after?.error || "Repository identity changed or inspection was incomplete. Inspect partial writes before recovery." };
   }
-  return files;
-}
-
-export function scopeCheck({ before, after, role, allowedFiles }) {
-  if (!before || !after) return { status: "skipped_not_git", changed_files: [], violations: [] };
-  const changed = [...after].filter((file) => !before.has(file)).sort();
-  const goalControl = (file) => /(^|\/)docs\/goals\//.test(file);
-  const relevant = changed.filter((file) => !goalControl(file));
+  const changed = [...new Set([...before.files.keys(), ...after.files.keys()])]
+    .filter((file) => before.files.get(file) !== after.files.get(file)).sort();
+  const controls = goalControlPaths(boardPath).map(path => portable(relative(before.root, path)));
+  const goalControl = file => file === ".git" || file.startsWith(".git/") || /(^|\/)docs\/goals(?:\/|$)/.test(file)
+    || controls.some(path => file === path || file.startsWith(`${path}/`));
+  const observation = { ...after.observation,
+    excluded_ignored_paths: [...new Set([...before.observation.excluded_ignored_paths, ...after.observation.excluded_ignored_paths])].sort(),
+    admitted_ignored_paths: [...new Set([...before.observation.admitted_ignored_paths, ...after.observation.admitted_ignored_paths])].sort(),
+  };
   if (READ_ONLY_ROLES.has(role)) {
-    return relevant.length
-      ? { status: "violations", changed_files: changed, violations: relevant, reason: `Read-only role "${role}" modified files.` }
-      : { status: "clean", changed_files: changed, violations: [] };
+    return changed.length
+      ? { status: "violations", observation, changed_files: changed, violations: changed, reason: `Read-only role "${role}" modified files. Changes were preserved for PM recovery.` }
+      : { status: "clean", observation, changed_files: changed, violations: [] };
   }
-  const violations = relevant.filter((file) => !allowedFiles.some((pattern) => matchesPattern(file, pattern)));
+  const violations = changed.filter((file) => goalControl(file)
+    || !allowedFiles.some((pattern) => {
+      const path = portable(relative(process.cwd(), resolve(before.root, file)));
+      if (matchesPattern(path, pattern)) return true;
+      // Creating/removing an ancestor directory is necessary for an exact file grant.
+      const entry = after.files.get(file) || before.files.get(file);
+      const directory = entry && !entry.includes("\nindex:") && JSON.parse(entry).type === "directory";
+      return directory && (before.files.get(file) == null || after.files.get(file) == null)
+        && String(pattern).startsWith(`${path}/`);
+    }));
   return violations.length
-    ? { status: "violations", changed_files: changed, violations, reason: "Files changed outside allowed_files." }
-    : { status: "clean", changed_files: changed, violations: [] };
-}
-
-export function matchesPattern(file, pattern) {
-  const normalized = String(pattern || "").replace(/\\/g, "/").trim();
-  if (!normalized) return false;
-  if (normalized === file) return true;
-  if (normalized.endsWith("/**")) return file.startsWith(normalized.slice(0, -2));
-  if (!normalized.includes("*")) return false;
-  const source = normalized.split("*").map(escapeRegExp).join("[^/]*");
-  return new RegExp(`^${source}$`).test(file);
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+    ? { status: "violations", observation, changed_files: changed, violations, reason: "Files changed outside allowed_files or in PM-owned goal controls. Changes were preserved for PM recovery." }
+    : { status: "clean", observation, changed_files: changed, violations: [] };
 }
 
 function cleanScalar(value) {

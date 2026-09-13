@@ -353,17 +353,17 @@ function normalizeTaskStatus(value) {
   return status;
 }
 
-export function parseGoalStateText(text) {
+export function parseGoalStateText(text, { strict = false } = {}) {
   try {
     const lines = tokenizeYaml(text);
     if (!lines.length) throw new GoalBoardError("Goal state is empty.");
-    const [value, nextIndex] = parseBlock(lines, 0, lines[0].indent);
+    const [value, nextIndex] = parseBlock(lines, 0, lines[0].indent, strict);
     if (nextIndex < lines.length) {
       throw new GoalBoardError(`Could not parse line ${lines[nextIndex].number}.`);
     }
     return value;
   } catch (error) {
-    if (error instanceof GoalBoardError && canRecoverBoardSubset(error)) {
+    if (!strict && error instanceof GoalBoardError && canRecoverBoardSubset(error)) {
       const document = parseGoalBoardSubset(text);
       document.__parseWarning = `Strict parse failed (${error.message}) Showing a best-effort fallback view; fields the fallback parser cannot read are omitted. Fix state.yaml formatting to see the full board.`;
       return document;
@@ -619,14 +619,23 @@ function stripComment(line) {
   return line;
 }
 
-function parseBlock(lines, index, indent) {
+function parseBlock(lines, index, indent, strict) {
   if (index >= lines.length) return [{}, index];
   if (lines[index].indent < indent) return [{}, index];
-  if (lines[index].text.startsWith("- ")) return parseArray(lines, index, indent);
-  return parseObject(lines, index, indent);
+  if (lines[index].text.startsWith("- ")) return parseArray(lines, index, indent, strict);
+  return parseObject(lines, index, indent, strict);
 }
 
-function parseObject(lines, index, indent) {
+function assignMapping(object, key, value, strict) {
+  if (strict) {
+    if (Object.hasOwn(object, key)) throw new GoalBoardError(`Duplicate YAML key: ${key}.`);
+    Object.defineProperty(object, key, { value, enumerable: true, writable: true, configurable: true });
+  } else {
+    object[key] = value;
+  }
+}
+
+function parseObject(lines, index, indent, strict) {
   const object = {};
   while (index < lines.length) {
     const line = lines[index];
@@ -638,20 +647,20 @@ function parseObject(lines, index, indent) {
 
     if (valueText === "") {
       if (index < lines.length && lines[index].indent > indent) {
-        const [child, nextIndex] = parseBlock(lines, index, lines[index].indent);
-        object[key] = child;
+        const [child, nextIndex] = parseBlock(lines, index, lines[index].indent, strict);
+        assignMapping(object, key, child, strict);
         index = nextIndex;
       } else {
-        object[key] = {};
+        assignMapping(object, key, {}, strict);
       }
     } else {
-      object[key] = parseScalar(valueText);
+      assignMapping(object, key, parseScalar(valueText), strict);
     }
   }
   return [object, index];
 }
 
-function parseArray(lines, index, indent) {
+function parseArray(lines, index, indent, strict) {
   const array = [];
   while (index < lines.length) {
     const line = lines[index];
@@ -662,7 +671,7 @@ function parseArray(lines, index, indent) {
 
     if (content === "") {
       if (index < lines.length && lines[index].indent > indent) {
-        const [child, nextIndex] = parseBlock(lines, index, lines[index].indent);
+        const [child, nextIndex] = parseBlock(lines, index, lines[index].indent, strict);
         array.push(child);
         index = nextIndex;
       } else {
@@ -674,11 +683,11 @@ function parseArray(lines, index, indent) {
     if (isInlineMapping(content)) {
       const object = {};
       const { key, valueText } = splitKeyValue({ text: content, number: line.number });
-      object[key] = valueText === "" ? {} : parseScalar(valueText);
+      assignMapping(object, key, valueText === "" ? {} : parseScalar(valueText), strict);
       if (index < lines.length && lines[index].indent > indent) {
-        const [child, nextIndex] = parseBlock(lines, index, lines[index].indent);
+        const [child, nextIndex] = parseBlock(lines, index, lines[index].indent, strict);
         if (child && typeof child === "object" && !Array.isArray(child)) {
-          Object.assign(object, child);
+          for (const [childKey, value] of Object.entries(child)) assignMapping(object, childKey, value, strict);
         } else {
           throw new GoalBoardError(`Expected mapping below line ${line.number}.`);
         }

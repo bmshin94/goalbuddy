@@ -66,7 +66,7 @@ Boards can also mix vendors within a single run — a Claude judge and a Codex w
 npx goalbuddy dispatch docs/goals/<slug> --to codex
 ```
 
-`dispatch` renders the active task's prompt, runs the target CLI headless (`codex` or `claude-code`), extracts the returned receipt, and verifies write scope mechanically with git: worker changes must stay inside the task's `allowed_files`, and read-only roles must change nothing. The dispatcher never edits the board — the PM records the receipt, stamped with the harness that earned it.
+`dispatch` renders the active task's prompt, runs the target CLI headless (`codex` or `claude-code`), extracts the returned receipt, and compares source contents/state and semantic Git state before and after, including existing dirty and untracked work in linked worktrees. Workers must stay inside `allowed_files`; Scout/Judge must change nothing. Goal controls are protected; the report explicitly lists ignored/generated and Git-storage exclusions. Failed required inspection leaves scope unproven. Changes are preserved for PM recovery. See the [execution contract](goalbuddy/references/goal-execution.md) for inspection limits and receipt handling.
 
 ## Codex Install Model
 
@@ -148,6 +148,8 @@ Judge chooses the largest safe useful slice.
 Worker completes the whole assigned slice and leaves a receipt.
 
 The execution command keeps the loop honest until a final Judge/PM audit maps receipts and verification back to the oracle and records the full outcome complete.
+
+Completion uses one authorized verification on the active final-audit task through `record-acceptance.mjs`; the final audit consumes its evidence without rerunning the command. The stop gate checks current outcome, validator/input bindings and board revision. This changes completion behavior: historical unverified claims stay intact but no longer authorize stopping. See the [verification and rollout contract](goalbuddy/references/goal-execution.md#one-observed-final-verification). Valid terminal blocks remain distinct from completion.
 
 ## Slice Sizing
 
