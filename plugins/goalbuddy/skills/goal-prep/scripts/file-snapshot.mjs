@@ -76,14 +76,18 @@ export function goalControlPaths(boardPath) {
 
 export function gitSnapshot(cwd = process.cwd(), { boardPath, admitted = [], previousPaths = [] } = {}) {
   try {
+    // Native resolution expands Windows short names before comparing Git and
+    // filesystem identities. Keep source symlink checks below lexical.
+    cwd = realpathSync.native(cwd);
+    if (boardPath) boardPath = realpathSync.native(boardPath);
     const git = args => {
       const result = spawnSync("git", args, { cwd, encoding: "utf8", timeout: 30000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
       if (result.error || result.status !== 0) throw new Error(`Git inspection failed (${args.join(" ")}): ${result.error?.message || result.stderr.trim()}`);
       return result.stdout;
     };
-    const root = realpathSync(git(["rev-parse", "--show-toplevel"]).trim());
-    const gitDir = realpathSync(git(["rev-parse", "--absolute-git-dir"]).trim());
-    const commonDir = realpathSync(resolve(cwd, git(["rev-parse", "--git-common-dir"]).trim()));
+    const root = realpathSync.native(git(["rev-parse", "--show-toplevel"]).trim());
+    const gitDir = realpathSync.native(git(["rev-parse", "--absolute-git-dir"]).trim());
+    const commonDir = realpathSync.native(resolve(cwd, git(["rev-parse", "--git-common-dir"]).trim()));
     const semantics = () => ({
       head: git(["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"]),
       index: git(["ls-files", "--stage", "-v", "-z"]),

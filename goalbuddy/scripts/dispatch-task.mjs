@@ -2,7 +2,7 @@
 // Dispatch one board task to an external harness CLI and verify the result.
 // Read-only toward state.yaml: prints the receipt and scope verdict; the PM records them.
 import { spawnSync } from "node:child_process";
-import { relative, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatPrompt, loadBoard, renderTaskPrompt, resolveBoardPath, selectTask } from "./render-task-prompt.mjs";
 import { gitSnapshot, goalControlPaths, insidePath, matchesPattern, portable } from "./file-snapshot.mjs";
@@ -60,7 +60,7 @@ export function parseDispatchArgs(args) {
 }
 
 export function dispatchTask(options) {
-  const boardPath = realpathSync(resolveBoardPath({ goalRoot: options.goalRoot }));
+  const boardPath = realpathSync.native(resolveBoardPath({ goalRoot: options.goalRoot }));
   const boardBytes = readFileSync(boardPath);
   const document = parseBoard(boardBytes.toString("utf8"));
   const board = loadBoard(boardPath);
@@ -84,7 +84,7 @@ export function dispatchTask(options) {
   if (task.harness && task.harness !== to) return failure("Dispatch target contradicts the task harness.", { task_id: task.id });
   const admitted = [...(task.allowed_files || []), ...(task.inputs || []).filter(path => typeof path === "string" && existsSync(resolve(path))), ...(task.acceptance?.artifacts || []), ...(task.acceptance?.inputs || [])];
   const before = gitSnapshot(process.cwd(), { boardPath, admitted });
-  if (!before.ok || !insidePath(before.root, realpathSync(boardPath))) {
+  if (!before.ok || !insidePath(before.root, realpathSync.native(boardPath))) {
     return failure("Cannot establish dispatch scope; harness was not started.", {
       task_id: task.id, harness: to, role,
       scope_check: { status: "unverifiable", changed_files: [], violations: [], reason: before.error || "Board is outside the inspected repository." },
@@ -144,11 +144,18 @@ function failure(message, extra = {}) {
 
 function runHarness(to, prompt, { model, sandbox, role, timeoutSeconds }) {
   const command = harnessCommand(to, prompt, { model, sandbox, role });
-  const result = spawnSync(command.file, command.args, {
+  let executable = command.file, shell = false;
+  if (process.platform === "win32") {
+    const where = spawnSync(join(process.env.SystemRoot || "C:\\Windows", "System32", "where.exe"), [executable], { encoding: "utf8", timeout: 5000 });
+    executable = where.status === 0 ? where.stdout.split(/\r?\n/).find(path => /\.(?:exe|com|cmd|bat)$/i.test(path)) : "";
+    if (!executable) return { error: `The ${to} CLI ("${command.file}") was not found on PATH. Install it or choose another --to target.` };
+    shell = /\.(?:cmd|bat)$/i.test(executable);
+  }
+  const result = spawnSync(executable, command.args, {
     cwd: process.cwd(),
     encoding: "utf8",
     timeout: timeoutSeconds * 1000,
-    shell: process.platform === "win32",
+    shell,
     env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
     maxBuffer: 32 * 1024 * 1024,
   });
@@ -261,7 +268,7 @@ export function scopeCheck({ before, after, role, allowedFiles, boardPath }) {
   }
   const violations = changed.filter((file) => goalControl(file)
     || !allowedFiles.some((pattern) => {
-      const path = portable(relative(process.cwd(), resolve(before.root, file)));
+      const path = portable(relative(realpathSync.native(process.cwd()), resolve(before.root, file)));
       if (matchesPattern(path, pattern)) return true;
       // Creating/removing an ancestor directory is necessary for an exact file grant.
       const entry = after.files.get(file) || before.files.get(file);

@@ -1,15 +1,20 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, chmodSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, constants, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, realpathSync, chmodSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, relative, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { dirname, join, relative, resolve } from "node:path";
+import childProcess, { spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
+import { fakeCommandBin, fixtureEnv, forwardGit } from "./core-fixtures.mjs";
 import assert from "node:assert/strict";
 
 import { toYamlLines } from "../../goalbuddy/scripts/apply-receipt.mjs";
+import { acceptanceContext, literalCommand } from "../../goalbuddy/scripts/acceptance-proof.mjs";
 import { sha256 } from "../../goalbuddy/scripts/file-snapshot.mjs";
 
 const script = resolve(process.env.GOALBUDDY_TEST_SCRIPT_ROOT || "goalbuddy/scripts", "check-can-stop.mjs");
 const recorder = resolve("goalbuddy/scripts/record-acceptance.mjs");
+const packageNode = process.platform === "win32" ? "node" : `"${process.execPath}"`;
 
 function makeGoal(state) {
   const root = mkdtempSync(join(tmpdir(), "goalbuddy-can-stop-"));
@@ -196,7 +201,7 @@ function acceptanceProject({ failing = false, inputs = [], timeout = 5 } = {}) {
 function stateFor(project, evidence, receiptChanges = {}, verification = "pass") {
   const active = !evidence;
   const receipt = active ? "    receipt: null\n" : "    receipt:\n" + toYamlLines({ result: "done", decision: "complete", full_outcome_complete: true, summary: "Final audit consumed the observed acceptance.", ...evidence, ...receiptChanges }, 6).join("\n") + "\n";
-  let state = doneState.replace(/    receipt:\n[\s\S]*?checks:\n/, `${toYamlLines({ acceptance: project.config }, 4).join("\n")}\n${receipt}checks:\n`);
+  let state = doneState.replace(/    receipt:\n[\s\S]*?checks:\n/, () => `${toYamlLines({ acceptance: project.config }, 4).join("\n")}\n${receipt}checks:\n`);
   if (active) state = state.replace("  status: done", "  status: active").replace("    status: done", "    status: active").replace("active_task: null", "active_task: T999").replace("    result: pass", "    result: unknown");
   else state = state.replace("    result: pass", `    result: ${verification}`);
   writeFileSync(join(project.goal, "state.yaml"), state);
@@ -206,6 +211,15 @@ function record(project, env = {}) {
   const result = spawnSync(process.execPath, [recorder, project.goal, "--", ...project.command], { cwd: project.repo, encoding: "utf8", timeout: project.outerTimeout || 15000, env: { ...process.env, ...env } });
   assert.equal(result.error, undefined, result.error?.message);
   return { status: result.status, report: JSON.parse(result.stdout || result.stderr) };
+}
+// Independent native npm execution for the exact-command failure controls.
+// These fixtures use only safe ASCII npm arguments; scripts remain in package.json.
+function runActual(command, options) {
+  if (process.platform === "win32" && ["npm", "npm.cmd"].includes(command[0])) {
+    assert.ok(command.slice(1).every(arg => /^[A-Za-z0-9_./:=+-]+$/.test(arg)));
+    return spawnSync(join(process.env.SystemRoot || "C:\\Windows", "System32/cmd.exe"), ["/d", "/s", "/c", command.join(" ")], { ...options, shell: false, windowsVerbatimArguments: true });
+  }
+  return spawnSync(command[0], command.slice(1), options);
 }
 function finalize(project, observed, changes = {}, verification = "pass") { stateFor(project, observed.report.audit_evidence, changes, verification); }
 function edit(path, from, to) { writeFileSync(path, readFileSync(path, "utf8").replace(from, to)); }
@@ -321,7 +335,7 @@ test("package launchers bind local script entry points and package configuration
   const project = acceptanceProject();
   try {
     project.command = project.config.command = ["npm", "run", "accept"];
-    writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `"${process.execPath}" acceptance.mjs` } }));
+    writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `${packageNode} acceptance.mjs` } }));
     stateFor(project);
     const observed = record(project);
     assert.equal(observed.status, 0, JSON.stringify(observed.report));
@@ -342,20 +356,21 @@ test("package launchers bind local script entry points and package configuration
 const literalEntryCases = [
   { name: "direct literal file", file: "acceptance.mjs", direct: ["acceptance.mjs"] },
   { name: "direct extensionless file", file: "acceptance", direct: ["acceptance"] },
+  { name: "direct literal shell punctuation without a shell", file: "acceptance %!&^$'.mjs", direct: ["acceptance %!&^$'.mjs"] },
   { name: "direct filename with spaces", file: "acceptance check.mjs", direct: ["acceptance check.mjs"] },
   { name: "package literal file", file: "acceptance.mjs", script: "node acceptance.mjs" },
   { name: "package extensionless file", file: "acceptance", script: "node acceptance" },
   { name: "concrete subdirectory file", file: "checks/run.mjs", script: "node checks/run.mjs" },
   { name: "ASCII tab separator", file: "acceptance.mjs", script: "node\tacceptance.mjs" },
   { name: "quoted local filename", file: "acceptance check.mjs", script: 'node "acceptance check.mjs"' },
-  { name: "single-quoted local filename", file: "acceptance check.mjs", script: "node 'acceptance check.mjs'" },
-  { name: "escaped local filename", file: "acceptance check.mjs", script: "node acceptance\\ check.mjs" },
+  { name: "single-quoted local filename", file: "acceptance check.mjs", script: "node 'acceptance check.mjs'", posixOnly: true },
+  { name: "escaped local filename", file: "acceptance check.mjs", script: "node acceptance\\ check.mjs", posixOnly: true },
   { name: "quoted local executable", file: "acceptance check.sh", script: '"./acceptance check.sh"', executable: true },
   { name: "direct local executable", file: "acceptance check.sh", direct: ["./acceptance check.sh"], executable: true },
   { name: "explicit-input concrete-file control", file: "acceptance.mjs", script: "node acceptance.mjs", explicit: true },
   { name: "unquoted NBSP without decoy", file: "acceptance\u00a0check.mjs", script: "node acceptance\u00a0check.mjs" },
   { name: "explicit-input NBSP control", file: "acceptance\u00a0check.mjs", script: "node acceptance\u00a0check.mjs", explicit: true, decoy: true },
-  { name: "quoted tab filename", file: "acceptance\tcheck.mjs", script: 'node "acceptance\tcheck.mjs"' },
+  { name: "quoted tab filename", file: "acceptance\tcheck.mjs", script: 'node "acceptance\tcheck.mjs"', invalidOnWindows: true },
   ...[
     ["NBSP", "\u00a0"], ["narrow NBSP", "\u202f"], ["em space", "\u2003"],
     ["Unicode line separator", "\u2028"], ["BOM", "\ufeff"],
@@ -366,30 +381,43 @@ const literalEntryCases = [
 ];
 for (const entry of literalEntryCases) {
   test(`R3 local entry freshness: ${entry.name}`, () => {
-    const project = acceptanceProject({ inputs: ["config.txt", ...(entry.explicit ? [entry.file] : [])] });
+    const recovery = process.platform === "win32" && (entry.invalidOnWindows || entry.posixOnly || entry.executable);
+    const file = recovery ? "acceptance check.mjs" : entry.file;
+    const shellExecutable = entry.executable && !recovery;
+    const project = acceptanceProject({ inputs: ["config.txt", ...(entry.explicit ? [file] : [])] });
     try {
       mkdirSync(join(project.repo, "checks"), { recursive: true });
       writeFileSync(join(project.repo, "config.txt"), "good");
-      writeFileSync(join(project.repo, entry.file), entry.executable ? "#!/bin/sh\nexit 0\n" : "process.exit(0);\n");
+      writeFileSync(join(project.repo, file), shellExecutable ? "#!/bin/sh\nexit 0\n" : "process.exit(0);\n");
+      if (recovery && entry.executable) writeFileSync(join(project.repo, entry.file), "#!/bin/sh\nexit 0\n");
       if (entry.decoy) writeFileSync(join(project.repo, "acceptance"), "process.exit(0);\n");
-      if (entry.executable) chmodSync(join(project.repo, entry.file), 0o755);
+      if (shellExecutable) chmodSync(join(project.repo, file), 0o755);
       const pkg = entry.script ? { scripts: { accept: entry.script } } : {};
       writeFileSync(join(project.repo, "package.json"), JSON.stringify(pkg));
       project.command = project.config.command = entry.direct ? (entry.executable ? entry.direct : [process.execPath, ...entry.direct]) : ["npm", "run", "--silent", "accept"];
       stateFor(project);
+      if (recovery) {
+        // Native cmd rejects POSIX-only escaping/shell executables, and Windows
+        // cannot create tab filenames. Each rejected launch recovers with direct
+        // concrete Node argv and retains the actual execution/freshness proof.
+        const rejected = record(project);
+        assert.equal(rejected.status, 1); assert.equal(rejected.report.proof_path, undefined);
+        assert.match(rejected.report.error, /direct local validator/);
+        project.command = project.config.command = [process.execPath, file]; stateFor(project);
+      }
       const observed = record(project); assert.equal(observed.status, 0, JSON.stringify(observed.report));
       finalize(project, observed);
       assert.equal(run(project.goal).report.can_stop, true);
       const board = readFileSync(join(project.goal, "state.yaml")), proof = readFileSync(observed.report.proof_path);
-      writeFileSync(join(project.repo, entry.file), entry.executable ? "#!/bin/sh\nexit 1\n" : "process.exit(1);\n");
-      const actual = spawnSync(project.command[0], project.command.slice(1), { cwd: project.repo, encoding: "utf8", timeout: 5000 });
+      writeFileSync(join(project.repo, file), shellExecutable ? "#!/bin/sh\nexit 1\n" : "process.exit(1);\n");
+      const actual = runActual(project.command, { cwd: project.repo, encoding: "utf8", timeout: 5000 });
       assert.equal(actual.status, 1, actual.stdout || actual.stderr);
       assert.deepEqual(readFileSync(join(project.goal, "state.yaml")), board);
       assert.deepEqual(readFileSync(observed.report.proof_path), proof);
       assert.equal(run(project.goal).report.can_stop, false, "A validator-only change must invalidate the earlier passing proof.");
       const inputs = JSON.parse(proof).binding.inputs;
-      assert.ok(inputs.includes(entry.file), "The concrete validator is bound.");
-      assert.ok(JSON.parse(proof).binding.local_entry_points.includes(entry.file));
+      assert.ok(inputs.includes(file), "The concrete validator is bound.");
+      assert.ok(JSON.parse(proof).binding.local_entry_points.includes(file));
       if (entry.decoy) assert.ok(!inputs.includes("acceptance"), "Unicode whitespace must not select a different file.");
       assert.ok(!inputs.includes(".") && !inputs.includes("checks"), "Bind the exact file without hashing its directory.");
     } finally { rmSync(project.repo, { recursive: true, force: true }); }
@@ -448,7 +476,7 @@ for (const entry of [
       assert.ok(JSON.parse(proof).binding.local_entry_points.includes(file));
       assert.ok(!JSON.parse(proof).binding.inputs.includes(entry.directory));
       writeFileSync(join(project.repo, file), "process.exit(1);\n");
-      const actual = spawnSync(project.command[0], project.command.slice(1), { cwd: project.repo, encoding: "utf8", timeout: 5000 });
+      const actual = runActual(project.command, { cwd: project.repo, encoding: "utf8", timeout: 5000 });
       assert.equal(actual.status, 1, actual.stdout || actual.stderr);
       assert.equal(run(project.goal).report.can_stop, false);
       assert.deepEqual(readFileSync(join(project.goal, "state.yaml")), board);
@@ -507,14 +535,14 @@ for (const argv of [
     const project = acceptanceProject();
     try {
       project.command = project.config.command = ["npm", ...argv];
-      writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `"${process.execPath}" acceptance.mjs` } }));
+      writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `${packageNode} acceptance.mjs` } }));
       stateFor(project);
       const observed = record(project);
       assert.equal(observed.status, 0, JSON.stringify(observed.report));
       finalize(project, observed);
       assert.equal(run(project.goal).report.can_stop, true);
       writeFileSync(join(project.repo, "acceptance.mjs"), "process.exit(1);");
-      const actual = spawnSync("npm", argv, { cwd: project.repo, encoding: "utf8", timeout: 5000 });
+      const actual = runActual(["npm", ...argv], { cwd: project.repo, encoding: "utf8", timeout: 5000 });
       assert.equal(actual.status, 1, actual.stdout || actual.stderr);
       assert.equal(run(project.goal).report.can_stop, false, "The exact declared command now fails; its earlier proof is stale.");
     } finally { rmSync(project.repo, { recursive: true, force: true }); }
@@ -546,7 +574,7 @@ for (const argv of [
     const project = acceptanceProject();
     try {
       project.command = project.config.command = ["npm", ...argv];
-      writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `"${process.execPath}" acceptance.mjs` } }));
+      writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `${packageNode} acceptance.mjs` } }));
       writeFileSync(join(project.repo, "acceptance.mjs"), 'import { writeFileSync } from "node:fs"; writeFileSync("executed", "bad");');
       stateFor(project);
       const observed = record(project);
@@ -562,7 +590,7 @@ test("package lifecycle alias and pre/post entry points are bound", () => {
   const project = acceptanceProject();
   try {
     project.command = project.config.command = ["npm", "--silent", "test"];
-    const scripts = { test: `"${process.execPath}" acceptance.mjs`, pretest: `"${process.execPath}" before.mjs`, posttest: `"${process.execPath}" after.mjs` };
+    const scripts = { test: `${packageNode} acceptance.mjs`, pretest: `${packageNode} before.mjs`, posttest: `${packageNode} after.mjs` };
     writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts }));
     writeFileSync(join(project.repo, "before.mjs"), "process.exit(0);");
     writeFileSync(join(project.repo, "after.mjs"), "process.exit(0);");
@@ -739,7 +767,7 @@ test("timeout also terminates a package launcher's validator process group", { s
   const project = acceptanceProject({ timeout: 1 });
   try {
     project.command = project.config.command = ["npm", "run", "accept"];
-    writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `"${process.execPath}" acceptance.mjs` } }));
+    writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `${packageNode} acceptance.mjs` } }));
     writeFileSync(join(project.repo, "acceptance.mjs"), 'import { writeFileSync } from "node:fs"; writeFileSync("started", "yes"); process.on("SIGTERM", () => {}); setTimeout(() => {}, 10000);');
     stateFor(project);
     const start = Date.now(), observed = record(project);
@@ -787,11 +815,15 @@ test("failed cleanup inspection remains explicitly unproven and bounded", () => 
     const preload = join(project.repo, "probe-denied.mjs");
     writeFileSync(preload, 'const kill = process.kill; process.kill = (pid, signal) => { if (signal === 0) { const error = new Error("fixture probe denied"); error.code = "EPERM"; throw error; } return kill.call(process, pid, signal); };');
     writeFileSync(join(project.repo, "acceptance.mjs"), 'setTimeout(() => {}, 10000);');
-    const start = Date.now(), observed = record(project, { NODE_OPTIONS: `--import=${preload}` });
+    const start = Date.now(), observed = record(project, { NODE_OPTIONS: `--import=${pathToFileURL(preload).href}` });
     assert.equal(observed.status, 1);
     assert.ok(Date.now() - start < 5000);
     assert.equal(observed.report.cleanup.status, "unproven");
-    assert.match(observed.report.error, /Cleanup unproven: fixture probe denied/);
+    assert.match(observed.report.error, /Cleanup unproven:/);
+    if (process.platform === "win32") {
+      assert.equal(observed.report.cleanup.scope, "direct_child");
+      assert.match(observed.report.error, /Could not establish/);
+    } else assert.match(observed.report.error, /fixture probe denied/);
     assert.equal(JSON.parse(readFileSync(observed.report.proof_path)).timed_out, true);
   } finally { rmSync(project.repo, { recursive: true, force: true }); }
 });
@@ -813,11 +845,9 @@ for (const phase of ["record", "stop"]) {
     const project = acceptanceProject();
     try {
       if (phase === "stop") { const observed = record(project); assert.equal(observed.status, 0); finalize(project, observed); }
-      const bin = join(project.repo, "fake-bin"); mkdirSync(bin);
-      const realGit = spawnSync("command", ["-v", "git"], { encoding: "utf8", shell: true }).stdout.trim();
       const replacement = join(project.repo, "active.yaml"); writeFileSync(replacement, activeState);
-      writeFileSync(join(bin, "git"), `#!/bin/sh\ncp '${replacement}' '${join(project.goal, "state.yaml")}'\nexec '${realGit}' "$@"\n`); chmodSync(join(bin, "git"), 0o755);
-      const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` };
+      const bin = fakeCommandBin(project.repo, "git", `fs.copyFileSync(${JSON.stringify(replacement)}, ${JSON.stringify(join(project.goal, "state.yaml"))}); ${forwardGit}`);
+      const env = fixtureEnv(bin);
       const result = phase === "record" ? record(project, env) : (() => { const run = spawnSync(process.execPath, [script, project.goal, "--json"], { cwd: project.repo, encoding: "utf8", env }); return { status: run.status, report: JSON.parse(run.stdout) }; })();
       assert.equal(result.status, 1, JSON.stringify(result.report));
       assert.notEqual(result.report.can_stop, true);
@@ -836,3 +866,325 @@ test("authorized long verification can finish beyond the old 120-second ceiling"
     assert.equal(run(project.goal).report.can_stop, true);
   } finally { rmSync(project.repo, { recursive: true, force: true }); }
 });
+
+test("workspace aliases share one acceptance binding and preserve validator freshness", () => {
+  const project = acceptanceProject(), alias = project.repo + "-alias";
+  try {
+    symlinkSync(realpathSync.native(project.repo), alias, process.platform === "win32" ? "junction" : "dir");
+    const canonicalGoal = project.goal; project.goal = join(alias,"docs/goals/one");
+    const observed = record(project); assert.equal(observed.status, 0, JSON.stringify(observed.report));
+    assert.equal(JSON.parse(readFileSync(observed.report.proof_path)).binding.workspace, realpathSync.native(project.repo));
+    finalize(project, observed);
+    assert.equal(run(canonicalGoal).report.can_stop, true);
+    assert.equal(run(project.goal).report.can_stop, true);
+    writeFileSync(join(project.repo,"acceptance.mjs"),"process.exit(1);");
+    assert.equal(spawnSync(project.command[0],project.command.slice(1),{cwd:project.repo}).status,1);
+    assert.equal(run(canonicalGoal).report.can_stop,false);
+    assert.equal(run(project.goal).report.can_stop,false);
+  } finally { rmSync(alias,{recursive:true,force:true}); rmSync(project.repo,{recursive:true,force:true}); }
+});
+
+
+for (const [source, expected] of [
+  ['node acceptance.mjs', ['node', 'acceptance.mjs']],
+  ['node "acceptance check.mjs"', ['node', 'acceptance check.mjs']],
+  [String.raw`node "checks\acceptance check.mjs"`, ["node", String.raw`checks\acceptance check.mjs`]],
+  ['node\tacceptance.mjs', ['node', 'acceptance.mjs']],
+  ...['\u00a0', '\u202f', '\u2003', '\u2028', '\ufeff'].flatMap(space => [
+    [`node acceptance${space}check.mjs`, ['node', `acceptance${space}check.mjs`]],
+    [`node "acceptance${space}check.mjs"`, ['node', `acceptance${space}check.mjs`]],
+  ]),
+]) {
+  test(`native Windows literal grammar: ${JSON.stringify(source)}`, () => {
+    assert.deepEqual(literalCommand(source, 'win32'), expected);
+  });
+}
+for (const source of [
+  "echo acceptance.mjs", "call acceptance.mjs", "@node.exe acceptance.mjs", "check.exe acceptance.mjs",
+  String.raw`"C:\Program Files\nodejs\node.exe" acceptance.mjs`,
+  "node 'acceptance check.mjs'", String.raw`node acceptance\ check.mjs`,
+  String.raw`node "acceptance\"check.mjs"`, 'node "acceptance".mjs',
+  'node "%VALIDATOR%"', 'node "!VALIDATOR!"', 'node acceptance^ check.mjs',
+  'node acceptance.mjs & node marker.mjs', 'node acceptance.mjs\nnode marker.mjs',
+  'node acceptance.mjs | node marker.mjs', 'node acceptance.mjs > marker',
+]) {
+  test(`native Windows ambiguous grammar rejects: ${JSON.stringify(source)}`, () => {
+    assert.throws(() => literalCommand(source, 'win32'), /direct local validator.*concrete filename/);
+    if (process.platform !== 'win32') return; // Grammar proof above runs on every host.
+    const project = acceptanceProject();
+    try {
+      writeFileSync(join(project.repo, 'acceptance.mjs'), 'import { writeFileSync } from "node:fs"; writeFileSync("executed", "bad");');
+      writeFileSync(join(project.repo, 'package.json'), JSON.stringify({ scripts: { accept: source } }));
+      project.command = project.config.command = ['npm', 'run', '--silent', 'accept']; stateFor(project);
+      const rejected = record(project);
+      assert.equal(rejected.status, 1); assert.equal(rejected.report.proof_path, undefined);
+      assert.match(rejected.report.error, /direct local validator/);
+      assert.equal(existsSync(join(project.repo, 'executed')), false);
+    } finally { rmSync(project.repo, { recursive: true, force: true }); }
+  });
+}
+
+test("exact local executable binds native callback dependencies and preserves freshness", () => {
+  const project = acceptanceProject();
+  try {
+    const bin = fakeCommandBin(project.repo, 'validator', 'process.exit(0);');
+    const file = `fake-bin/validator${process.platform === 'win32' ? '.exe' : ''}`;
+    const body = 'fake-bin/validator.cjs';
+    project.command = project.config.command = [resolve(project.repo, file)];
+    project.config.inputs = [body, 'fake-bin/bootstrap.cjs']; stateFor(project);
+    const env = fixtureEnv(bin), observed = record(project, env);
+    assert.equal(observed.status, 0, JSON.stringify(observed.report));
+    const proof = JSON.parse(readFileSync(observed.report.proof_path));
+    assert.ok(proof.binding.local_entry_points.includes(file));
+    assert.ok(proof.binding.inputs.includes(body));
+    finalize(project, observed); assert.equal(run(project.goal).report.can_stop, true);
+    edit(join(project.repo, body), 'process.exit(0);', 'process.exit(1);');
+    assert.equal(runActual(project.command, { cwd: project.repo, env, timeout: 5000 }).status, 1);
+    assert.equal(run(project.goal).report.can_stop, false);
+  } finally { rmSync(project.repo, { recursive: true, force: true }); }
+});
+
+test("npm execution observes the bound concrete Node argv and native shell selection", () => {
+  const project = acceptanceProject();
+  try {
+    const validator = 'acceptance\u00a0 check.mjs';
+    writeFileSync(join(project.repo, validator), 'import { writeFileSync } from "node:fs"; writeFileSync("observed.json", JSON.stringify({ argv:process.argv, event:process.env.npm_lifecycle_event, script:process.env.npm_lifecycle_script, shell:process.env.npm_config_script_shell }));');
+    const cmd = `node "${validator}" expected`;
+    writeFileSync(join(project.repo, 'package.json'), JSON.stringify({ scripts: { accept: cmd } }));
+    project.command = project.config.command = ['npm', 'run', '--silent', 'accept']; stateFor(project);
+    // A conflicting per-process npm shell must not change the Windows grammar.
+    const observed = record(project, process.platform === 'win32' ? { npm_config_script_shell: 'nonexistent-shell.exe' } : {});
+    assert.equal(observed.status, 0, JSON.stringify(observed.report));
+    const actual = JSON.parse(readFileSync(join(project.repo, 'observed.json')));
+    assert.equal(realpathSync.native(actual.argv[0]), realpathSync.native(process.execPath));
+    assert.equal(realpathSync.native(actual.argv[1]), realpathSync.native(join(project.repo, validator)));
+    assert.deepEqual(actual.argv.slice(2), ['expected']);
+    assert.equal(actual.event, 'accept'); assert.equal(actual.script, cmd);
+    const proof = JSON.parse(readFileSync(observed.report.proof_path));
+    assert.ok(proof.binding.local_entry_points.includes(validator));
+    if (process.platform === 'win32') {
+      assert.equal(proof.binding.launcher.kind, 'windows_bundled_npm');
+      assert.equal(realpathSync.native(actual.shell), proof.binding.launcher.script_shell);
+      assert.match(proof.binding.launcher.npm_cli, /npm-cli\.js$/);
+    } else assert.equal(proof.binding.launcher, undefined);
+    finalize(project, observed); assert.equal(run(project.goal).report.can_stop, true);
+    writeFileSync(join(project.repo, validator), 'process.exit(1);');
+    assert.equal(runActual(project.command, { cwd: project.repo, timeout: 5000 }).status, 1);
+    assert.equal(run(project.goal).report.can_stop, false);
+  } finally { rmSync(project.repo, { recursive: true, force: true }); }
+});
+
+// Native-only integration assertions are exercised by Windows CI. Host grammar
+// tests above are supporting evidence, not substitutes for executing cmd.exe.
+if (process.platform === 'win32') {
+  test("native package lookup preserves local runtime symlink rejection", () => {
+    const project = acceptanceProject();
+    try {
+      symlinkSync(process.execPath, join(project.repo, "node.exe"), "file");
+      writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: "node acceptance.mjs" } }));
+      project.command = project.config.command = ["npm", "run", "--silent", "accept"]; stateFor(project);
+      const observed = record(project);
+      assert.equal(observed.status, 1); assert.equal(observed.report.proof_path, undefined);
+      assert.match(observed.report.error, /symlink/i);
+    } finally { rmSync(project.repo, { recursive: true, force: true }); }
+  });
+  for (const shadow of ['node.cmd', 'node_modules/.bin/node.cmd']) {
+    test(`native npm rejects a shadow Node launcher before execution: ${shadow}`, () => {
+      const project = acceptanceProject();
+      try {
+        mkdirSync(resolve(project.repo, shadow, '..'), { recursive: true });
+        writeFileSync(join(project.repo, shadow), '@echo forbidden>executed\r\n@exit /b 0\r\n');
+        writeFileSync(join(project.repo, 'package.json'), JSON.stringify({ scripts: { accept: 'node acceptance.mjs' } }));
+        project.command = project.config.command = ['npm', 'run', '--silent', 'accept']; stateFor(project);
+        const observed = record(project);
+        assert.equal(observed.status, 1); assert.equal(observed.report.proof_path, undefined);
+        assert.match(observed.report.error, /direct local validator/);
+        assert.equal(existsSync(join(project.repo, 'executed')), false);
+        project.command = project.config.command = [process.execPath, 'acceptance.mjs']; stateFor(project);
+        const recovered = record(project); assert.equal(recovered.status, 0, JSON.stringify(recovered.report));
+        finalize(project, recovered); assert.equal(run(project.goal).report.can_stop, true);
+      } finally { rmSync(project.repo, { recursive: true, force: true }); }
+    });
+  }
+  for (const command of [
+    ['pnpm', 'run', 'accept'], ['yarn', 'run', 'accept'],
+    ['npm', 'run', 'accept', '--', '%VALIDATOR%'], ['npm', 'run', 'accept', '--', 'argument with spaces'],
+    ['check.cmd'],
+  ]) {
+    test(`native unsupported launch rejects before execution: ${JSON.stringify(command)}`, () => {
+      const project = acceptanceProject();
+      try {
+        writeFileSync(join(project.repo, 'check.cmd'), '@echo forbidden>executed\r\n@exit /b 0\r\n');
+        writeFileSync(join(project.repo, 'package.json'), JSON.stringify({ scripts: { accept: 'node acceptance.mjs' } }));
+        project.command = project.config.command = command; stateFor(project);
+        const observed = record(project);
+        assert.equal(observed.status, 1); assert.equal(observed.report.proof_path, undefined);
+        assert.match(observed.report.error, /direct local validator/);
+        assert.equal(existsSync(join(project.repo, 'executed')), false);
+      } finally { rmSync(project.repo, { recursive: true, force: true }); }
+    });
+  }
+}
+
+
+const nodeCaseSpellings = ["node.exe", "NODE.EXE", "Node.exe", "nOdE.ExE"];
+
+function assertCaseFileFreshness(project, command, file) {
+  project.command = project.config.command = command; stateFor(project);
+  const observed = record(project); assert.equal(observed.status, 0, JSON.stringify(observed.report));
+  const proof = readFileSync(observed.report.proof_path);
+  assert.ok(JSON.parse(proof).binding.local_entry_points.includes(file));
+  finalize(project, observed); assert.equal(run(project.goal).report.can_stop, true);
+  const board = readFileSync(join(project.goal, "state.yaml"));
+  writeFileSync(join(project.repo, file), "process.exit(1);\n");
+  assert.equal(runActual(command, { cwd: project.repo, encoding: "utf8", timeout: 5000 }).status, 1);
+  assert.equal(run(project.goal).report.can_stop, false);
+  assert.deepEqual(readFileSync(observed.report.proof_path), proof);
+  assert.deepEqual(readFileSync(join(project.goal, "state.yaml")), board);
+  writeFileSync(join(project.repo, file), "process.exit(0);\n");
+}
+
+// Host-only branch probe: actual filesystem and renamed host Node callbacks,
+// mocked Windows platform/runtime/where identities. It never executes cmd.exe
+// or produces a simulated Windows acceptance proof. Restore globals per call.
+function windowsCaseContext(project, runtime, resolvedExecutable, system) {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  const executable = Object.getOwnPropertyDescriptor(process, "execPath");
+  const systemRoot = process.env.SystemRoot, actualSpawn = childProcess.spawnSync;
+  try {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    Object.defineProperty(process, "execPath", { value: runtime });
+    process.env.SystemRoot = system;
+    childProcess.spawnSync = (file, args, options) => String(file).endsWith("where.exe")
+      ? { status: 0, stdout: resolvedExecutable + "\n", stderr: "" } : actualSpawn(file, args, options);
+    syncBuiltinESMExports();
+    const state = join(project.goal, "state.yaml");
+    return acceptanceContext(state, readFileSync(state));
+  } finally {
+    Object.defineProperty(process, "platform", platform); Object.defineProperty(process, "execPath", executable);
+    if (systemRoot === undefined) delete process.env.SystemRoot; else process.env.SystemRoot = systemRoot;
+    childProcess.spawnSync = actualSpawn; syncBuiltinESMExports();
+  }
+}
+
+if (process.platform !== "win32") {
+  for (const spelling of nodeCaseSpellings) {
+    test(`Windows case classification host branch rejects copied runtime and directory bypass: ${spelling}`, () => {
+      const project = acceptanceProject();
+      try {
+        const runtimeDir = join(project.repo, "simulated-runtime"), system = join(project.repo, "simulated-system");
+        mkdirSync(join(runtimeDir, "node_modules/npm/bin"), { recursive: true });
+        mkdirSync(join(system, "System32"), { recursive: true });
+        writeFileSync(join(runtimeDir, "node_modules/npm/bin/npm-cli.js"), "// identity fixture; never executed\n");
+        writeFileSync(join(system, "System32/cmd.exe"), "identity fixture; never executed\n");
+        const runtime = join(runtimeDir, "node.exe"), shadow = join(project.repo, spelling);
+        copyFileSync(process.execPath, runtime, constants.COPYFILE_FICLONE);
+        copyFileSync(process.execPath, shadow, constants.COPYFILE_FICLONE);
+        chmodSync(runtime, 0o755); chmodSync(shadow, 0o755);
+        mkdirSync(join(project.repo, "checks"));
+        for (const file of ["checks/index.js", "checks/run.mjs"]) writeFileSync(join(project.repo, file), "process.exit(0);\n");
+        // The review's real renamed-binary callback: its directory validator
+        // actually changes exit status after only index.js changes.
+        assert.equal(spawnSync(shadow, ["checks"], { cwd: project.repo, timeout: 5000 }).status, 0);
+        writeFileSync(join(project.repo, "checks/index.js"), "process.exit(1);\n");
+        assert.equal(spawnSync(shadow, ["checks"], { cwd: project.repo, timeout: 5000 }).status, 1);
+        project.config.workspace = "../../..";
+        for (const operand of ["checks", "checks/", ".", "checks/run.mjs"]) {
+          writeFileSync(join(project.repo, "package.json"), JSON.stringify({ main: "checks/run.mjs", scripts: { accept: `${spelling} ${operand}` } }));
+          project.command = project.config.command = ["npm", "run", "--silent", "accept"]; stateFor(project);
+          assert.throws(() => windowsCaseContext(project, runtime, shadow, system), /shadowed or differs.*direct local validator/);
+          if (operand !== "checks/run.mjs") {
+            assert.throws(() => windowsCaseContext(project, runtime, runtime, system), /exact local file/);
+            project.command = project.config.command = [shadow, operand]; stateFor(project);
+            assert.throws(() => windowsCaseContext(project, runtime, shadow, system), /exact local file/);
+          }
+        }
+        writeFileSync(join(project.repo, "checks/package.json"), JSON.stringify({ main: "run.mjs" }));
+        project.command = project.config.command = [shadow, "checks"]; stateFor(project);
+        assert.throws(() => windowsCaseContext(project, runtime, shadow, system), /exact local file/);
+        // Explicit direct runtimes keep their existing authority: exact file,
+        // both binary and validator bound, regardless of the .exe letter case.
+        project.command = project.config.command = [shadow, "checks/run.mjs"]; stateFor(project);
+        const direct = windowsCaseContext(project, runtime, shadow, system).binding;
+        assert.ok(direct.local_entry_points.includes("checks/run.mjs"));
+        assert.ok(direct.local_entry_points.includes(spelling));
+        project.command = project.config.command = ["npm", "run", "--silent", "accept"]; stateFor(project);
+        const before = windowsCaseContext(project, runtime, runtime, system).binding;
+        assert.ok(before.local_entry_points.includes("checks/run.mjs"));
+        assert.equal(spawnSync(runtime, ["checks/run.mjs"], { cwd: project.repo, timeout: 5000 }).status, 0);
+        writeFileSync(join(project.repo, "checks/run.mjs"), "process.exit(1);\n");
+        assert.equal(spawnSync(runtime, ["checks/run.mjs"], { cwd: project.repo, timeout: 5000 }).status, 1);
+        assert.notEqual(windowsCaseContext(project, runtime, runtime, system).binding.inputs_sha256, before.inputs_sha256);
+        project.command = project.config.command = [shadow, "checks/run.mjs"]; stateFor(project);
+        assert.notEqual(windowsCaseContext(project, runtime, shadow, system).binding.inputs_sha256, direct.inputs_sha256);
+        writeFileSync(join(project.repo, "checks/run.mjs"), "process.exit(0);\n");
+        // Actual recorder -> final audit -> failing exact command -> stale stop,
+        // using real host Node argv after all branch simulation is restored.
+        assertCaseFileFreshness(project, [process.execPath, "checks/run.mjs"], "checks/run.mjs");
+      } finally { rmSync(project.repo, { recursive: true, force: true }); }
+    });
+  }
+
+  test("POSIX case classification preserves a distinct uppercase local executable", () => {
+    const project = acceptanceProject();
+    try {
+      const bin = fakeCommandBin(project.repo, "NODE.EXE", 'process.exit(fs.readFileSync("checks/result", "utf8") === "pass" ? 0 : 1);');
+      mkdirSync(join(project.repo, "checks")); writeFileSync(join(project.repo, "checks/result"), "pass");
+      project.command = project.config.command = [join(bin, "NODE.EXE"), "checks"];
+      project.config.inputs = ["checks/result", "fake-bin/NODE.EXE.cjs"]; stateFor(project);
+      const observed = record(project); assert.equal(observed.status, 0, JSON.stringify(observed.report));
+      finalize(project, observed); assert.equal(run(project.goal).report.can_stop, true);
+      writeFileSync(join(project.repo, "checks/result"), "fail");
+      assert.equal(runActual(project.command, { cwd: project.repo, timeout: 5000 }).status, 1);
+      assert.equal(run(project.goal).report.can_stop, false);
+    } finally { rmSync(project.repo, { recursive: true, force: true }); }
+  });
+}
+
+// These assertions require actual Win32 filename aliases, native npm/cmd, and
+// a copied PE executable. Host branch simulations above cannot certify them.
+if (process.platform === "win32") {
+  for (const spelling of nodeCaseSpellings) {
+    test(`native Windows case classification accepts current runtime aliases and rejects directory/shadow launches: ${spelling}`, () => {
+      const project = acceptanceProject();
+      try {
+        const current = join(dirname(process.execPath), spelling);
+        assert.equal(realpathSync.native(current), realpathSync.native(process.execPath));
+        mkdirSync(join(project.repo, "checks"));
+        for (const file of ["checks/index.js", "checks/run.mjs"]) writeFileSync(join(project.repo, file), "process.exit(0);\n");
+        writeFileSync(join(project.repo, "checks/package.json"), JSON.stringify({ main: "run.mjs" }));
+        writeFileSync(join(project.repo, "package.json"), JSON.stringify({ main: "checks/run.mjs", scripts: { accept: `${spelling} checks/run.mjs` } }));
+        assertCaseFileFreshness(project, [current, "checks/run.mjs"], "checks/run.mjs");
+        assertCaseFileFreshness(project, ["npm", "run", "--silent", "accept"], "checks/run.mjs");
+        for (const file of ["index.js", "checks/index.js", "checks/run.mjs"]) writeFileSync(join(project.repo, file), 'import("node:fs").then(fs => fs.writeFileSync("executed", "bad"));');
+        const shadow = join(project.repo, spelling);
+        for (const useShadow of [false, true]) {
+          if (useShadow) copyFileSync(process.execPath, shadow, constants.COPYFILE_FICLONE);
+          for (const { operand, main } of [
+            { operand: "checks", main: false }, { operand: "checks/", main: true },
+            { operand: ".", main: false }, { operand: ".", main: true },
+          ]) {
+            if (main) writeFileSync(join(project.repo, "checks/package.json"), JSON.stringify({ main: "run.mjs" }));
+            else rmSync(join(project.repo, "checks/package.json"), { force: true });
+            writeFileSync(join(project.repo, "package.json"), JSON.stringify({ ...(main ? { main: "checks/run.mjs" } : {}), scripts: { accept: `${spelling} ${operand}` } }));
+            for (const command of [[useShadow ? shadow : current, operand], ["npm", "run", "--silent", "accept"]]) {
+              project.command = project.config.command = command; stateFor(project);
+              const board = readFileSync(join(project.goal, "state.yaml")), observed = record(project);
+              assert.equal(observed.status, 1); assert.equal(observed.report.proof_path, undefined);
+              assert.match(observed.report.error, /exact local file|shadowed or differs/);
+              assert.equal(existsSync(join(project.repo, "executed")), false);
+              assert.deepEqual(readFileSync(join(project.goal, "state.yaml")), board);
+            }
+          }
+        }
+        writeFileSync(join(project.repo, "checks/run.mjs"), "process.exit(0);\n");
+        writeFileSync(join(project.repo, "package.json"), JSON.stringify({ scripts: { accept: `${spelling} checks/run.mjs` } }));
+        project.command = project.config.command = ["npm", "run", "--silent", "accept"]; stateFor(project);
+        const rejected = record(project); assert.equal(rejected.status, 1); assert.equal(rejected.report.proof_path, undefined);
+        assert.match(rejected.report.error, /shadowed or differs/);
+        assertCaseFileFreshness(project, [shadow, "checks/run.mjs"], "checks/run.mjs");
+        assertCaseFileFreshness(project, [current, "checks/run.mjs"], "checks/run.mjs");
+      } finally { rmSync(project.repo, { recursive: true, force: true }); }
+    });
+  }
+}

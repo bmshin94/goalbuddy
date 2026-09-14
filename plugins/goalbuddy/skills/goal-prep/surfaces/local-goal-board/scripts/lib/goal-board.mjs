@@ -608,7 +608,9 @@ function stripComment(line) {
   for (let index = 0; index < line.length; index += 1) {
     const char = line[index];
     const previous = line[index - 1];
-    if ((char === "\"" || char === "'") && previous !== "\\") {
+    if (quote === '"' && char === "\\") { index++; continue; }
+    if (quote === "'" && char === "'" && line[index + 1] === "'") { index++; continue; }
+    if (char === "\"" || char === "'") {
       quote = quote === char ? null : quote || char;
       continue;
     }
@@ -728,12 +730,7 @@ function parseScalar(text) {
     if (!inner) return [];
     return splitInlineArray(inner).map(parseScalar);
   }
-  if (
-    (text.startsWith("\"") && text.endsWith("\"")) ||
-    (text.startsWith("'") && text.endsWith("'"))
-  ) {
-    return unquote(text);
-  }
+  if (text.startsWith('"') || text.startsWith("'")) return unquote(text);
   if (text === "|" || text === ">") {
     throw new GoalBoardError("Block scalar YAML is not supported by this lightweight parser.");
   }
@@ -741,12 +738,32 @@ function parseScalar(text) {
 }
 
 function unquote(text) {
-  if (text.startsWith("'")) return text.slice(1, -1).replace(/''/g, "'");
-  return text
-    .slice(1, -1)
-    .replace(/\\"/g, "\"")
-    .replace(/\\n/g, "\n")
-    .replace(/\\\\/g, "\\");
+  const quote = text[0];
+  if (text.length < 2 || text.at(-1) !== quote) throw new GoalBoardError("Unclosed quoted scalar.");
+  let value = "";
+  // Consume each escape once. Chained replacements reinterpret the literal
+  // backslash in JSON.stringify's "\\\\node" as a newline escape.
+  const escapes = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+  for (let index = 1; index < text.length - 1; index++) {
+    const char = text[index];
+    if (char === quote) {
+      if (quote === "'" && text[index + 1] === "'" && index + 1 < text.length - 1) { value += "'"; index++; continue; }
+      throw new GoalBoardError("Unexpected quote in quoted scalar.");
+    }
+    if (quote === '"' && char === "\\") {
+      if (++index >= text.length - 1) throw new GoalBoardError("Incomplete quoted scalar escape.");
+      const escaped = text[index];
+      if (escaped === "u") {
+        const hex = text.slice(index + 1, index + 5);
+        if (!/^[a-fA-F0-9]{4}$/.test(hex)) throw new GoalBoardError("Malformed quoted scalar Unicode escape.");
+        value += String.fromCharCode(parseInt(hex, 16)); index += 4;
+      } else {
+        // Unknown legacy escapes were literal; keep that supported shape.
+        value += Object.hasOwn(escapes, escaped) ? escapes[escaped] : `\\${escaped}`;
+      }
+    } else value += char;
+  }
+  return value;
 }
 
 function splitInlineArray(text) {
@@ -755,8 +772,9 @@ function splitInlineArray(text) {
   let start = 0;
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
-    const previous = text[index - 1];
-    if ((char === "\"" || char === "'") && previous !== "\\") {
+    if (quote === '"' && char === "\\") { index++; continue; }
+    if (quote === "'" && char === "'" && text[index + 1] === "'") { index++; continue; }
+    if (char === "\"" || char === "'") {
       quote = quote === char ? null : quote || char;
       continue;
     }
@@ -765,6 +783,7 @@ function splitInlineArray(text) {
       start = index + 1;
     }
   }
+  if (quote) throw new GoalBoardError("Unclosed quoted scalar in inline array.");
   values.push(text.slice(start).trim());
   return values;
 }

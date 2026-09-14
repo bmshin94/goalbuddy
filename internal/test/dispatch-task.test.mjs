@@ -1,11 +1,14 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, openSync, closeSync, ftruncateSync, statSync, utimesSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, openSync, closeSync, ftruncateSync, statSync, realpathSync, utimesSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { fakeCommandBin, fixtureEnv, forwardGit } from "./core-fixtures.mjs";
 import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
 
 const dispatcher = resolve(process.env.GOALBUDDY_TEST_SCRIPT_ROOT || "goalbuddy/scripts", "dispatch-task.mjs");
+const { gitSnapshot, insidePath, localPath } = await import(pathToFileURL(resolve(dispatcher, "../file-snapshot.mjs")));
 
 function makeProject({ taskType = "worker" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "goalbuddy-dispatch-"));
@@ -44,14 +47,7 @@ tasks:
   return root;
 }
 
-function fakeHarnessBin(root, name, script) {
-  const bin = join(root, "fake-bin");
-  mkdirSync(bin, { recursive: true });
-  const path = join(bin, name);
-  writeFileSync(path, `#!/bin/sh\n${script}\n`);
-  chmodSync(path, 0o755);
-  return bin;
-}
+const fakeHarnessBin = fakeCommandBin;
 
 const RECEIPT = JSON.stringify({
   goalbuddy_receipt_v1: {
@@ -69,7 +65,7 @@ function runDispatch(root, bin, extraArgs = []) {
   return spawnSync(process.execPath, [dispatcher, "docs/goals/one", "--to", "codex", "--timeout", "5", "--json", ...extraArgs], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
+    env: fixtureEnv(bin),
     timeout: 15000,
   });
 }
@@ -77,7 +73,7 @@ function runDispatch(root, bin, extraArgs = []) {
 test("dispatch runs an external worker and reports a clean scope", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `if printf '%s\\n' "$@" | grep -q 'Native wait_agent timeouts'; then exit 42; fi\necho "export const widget = 2;" > src/widget.mjs\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `if (args.join(" ").includes("Native wait_agent timeouts")) process.exit(42);\nfs.writeFileSync("src/widget.mjs", "export const widget = 2;\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const report = JSON.parse(result.stdout);
@@ -93,7 +89,7 @@ test("dispatch runs an external worker and reports a clean scope", () => {
 test("dispatch flags out-of-scope writes from an external worker", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `echo "tampered" >> README.md\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("README.md", "tampered\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     const report = JSON.parse(result.stdout);
@@ -108,7 +104,7 @@ test("dispatch flags out-of-scope writes from an external worker", () => {
 test("dispatch flags any write from a read-only role", () => {
   const root = makeProject({ taskType: "scout" });
   try {
-    const bin = fakeHarnessBin(root, "codex", `echo "export const widget = 2;" > src/widget.mjs\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.writeFileSync("src/widget.mjs", "export const widget = 2;\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     const report = JSON.parse(result.stdout);
@@ -122,7 +118,7 @@ test("dispatch flags any write from a read-only role", () => {
 test("dispatch extracts receipts wrapped in markdown fences", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `printf 'Here you go:\\n\\n\`\`\`json\\n%s\\n\`\`\`\\n' '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `console.log("Here you go: "); console.log("\`\`\`json"); console.log(${JSON.stringify(RECEIPT)}); console.log("\`\`\`");`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.equal(JSON.parse(result.stdout).receipt.summary, "widget adjusted");
@@ -134,14 +130,11 @@ test("dispatch extracts receipts wrapped in markdown fences", () => {
 test("dispatch reports a missing harness CLI cleanly", () => {
   const root = makeProject();
   try {
-    const bin = join(root, "sparse-bin");
-    mkdirSync(bin, { recursive: true });
-    const gitPath = spawnSync("command", ["-v", "git"], { encoding: "utf8", shell: true }).stdout.trim();
-    symlinkSync(gitPath, join(bin, "git"));
+    const bin = fakeHarnessBin(root, "git", forwardGit);
     const result = spawnSync(process.execPath, [dispatcher, "docs/goals/one", "--to", "codex", "--json"], {
       cwd: root,
       encoding: "utf8",
-      env: { ...process.env, PATH: bin },
+      env: fixtureEnv(bin, { PATH: "" }),
     });
     assert.equal(result.status, 1, result.stdout);
     const report = JSON.parse(result.stdout);
@@ -170,11 +163,11 @@ test("dispatch rejects unsupported harness targets", () => {
 test("external dispatch timeout is terminal and still reports partial writes", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", "echo 'partial external write' >> README.md\nwhile :; do :; done");
+    const bin = fakeHarnessBin(root, "codex", 'fs.appendFileSync("README.md", "partial external write"); while (true) {}');
     const result = spawnSync(process.execPath, [dispatcher, "docs/goals/one", "--to", "codex", "--timeout", "1", "--json"], {
       cwd: root,
       encoding: "utf8",
-      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
+      env: fixtureEnv(bin),
     });
     assert.equal(result.status, 1, result.stdout);
     const report = JSON.parse(result.stdout);
@@ -191,12 +184,12 @@ test("external dispatch timeout is terminal and still reports partial writes", (
 test("goalbuddy dispatch CLI wrapper forwards to the bundled script", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `echo "export const widget = 2;" > src/widget.mjs\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.writeFileSync("src/widget.mjs", "export const widget = 2;\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const cli = resolve("internal/cli/goal-maker.mjs");
     const result = spawnSync(process.execPath, [cli, "dispatch", "docs/goals/one", "--to", "codex", "--json"], {
       cwd: root,
       encoding: "utf8",
-      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
+      env: fixtureEnv(bin),
     });
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const report = JSON.parse(result.stdout);
@@ -210,7 +203,7 @@ test("goalbuddy dispatch CLI wrapper forwards to the bundled script", () => {
 test("dispatch rejects receipt-shaped fragments that are not real receipts", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `echo '{"goalbuddy_receipt_v1": true}'\necho 'later, the real one:'\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `console.log('{"goalbuddy_receipt_v1": true}'); console.log("later, the real one:"); console.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const report = JSON.parse(result.stdout);
@@ -229,7 +222,7 @@ test("dispatch extracts bare receipts returned without the envelope", () => {
       decision: "approved",
       summary: "bare receipt",
     });
-    const bin = fakeHarnessBin(root, "codex", `echo "export const widget = 2;" > src/widget.mjs\nprintf 'Some prose first.\\n\`\`\`json\\n%s\\n\`\`\`\\n' '${bare}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.writeFileSync("src/widget.mjs", "export const widget = 2;"); console.log("Some prose first.\\n\`\`\`json"); console.log(${JSON.stringify(bare)}); console.log("\`\`\`");`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const report = JSON.parse(result.stdout);
@@ -245,7 +238,7 @@ for (const role of ["scout", "judge"]) {
     const root = makeProject({ taskType: role });
     try {
       writeFileSync(join(root, "README.md"), "existing user work\n");
-      const bin = fakeHarnessBin(root, "codex", `echo 'unauthorized append' >> README.md\necho '${RECEIPT}'`);
+      const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("README.md", "unauthorized append\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
       const result = runDispatch(root, bin);
       const report = JSON.parse(result.stdout);
       assert.equal(result.status, 1, result.stdout);
@@ -258,23 +251,23 @@ for (const role of ["scout", "judge"]) {
 }
 
 for (const [name, setup, script, violations] of [
-  ["existing untracked edit", (root) => writeFileSync(join(root, "draft.txt"), "user draft\n"), "echo changed >> draft.txt", ["draft.txt"]],
-  ["untracked deletion", (root) => writeFileSync(join(root, "draft.txt"), "user draft\n"), "rm draft.txt", ["draft.txt"]],
-  ["tracked deletion", () => {}, "rm README.md", ["README.md"]],
-  ["dirty file restored to HEAD", (root) => writeFileSync(join(root, "README.md"), "user draft\n"), "git show HEAD:README.md > README.md", ["README.md"]],
-  ["tracked rename", () => {}, "mv README.md renamed.md", ["README.md", "renamed.md"]],
-  ["staged rename", () => {}, "git mv README.md renamed.md", ["README.md", "renamed.md"]],
-  ["mode-only edit", () => {}, "chmod +x README.md", ["README.md"]],
-  ["symlink replacement", (root) => symlinkSync("README.md", join(root, "link")), "rm link; ln -s src/widget.mjs link", ["link"]],
+  ["existing untracked edit", (root) => writeFileSync(join(root, "draft.txt"), "user draft\n"), 'fs.appendFileSync("draft.txt", "changed");', ["draft.txt"]],
+  ["untracked deletion", (root) => writeFileSync(join(root, "draft.txt"), "user draft\n"), 'fs.unlinkSync("draft.txt");', ["draft.txt"]],
+  ["tracked deletion", () => {}, 'fs.unlinkSync("README.md");', ["README.md"]],
+  ["dirty file restored to HEAD", (root) => writeFileSync(join(root, "README.md"), "user draft\n"), 'fs.writeFileSync("README.md", git(["show", "HEAD:README.md"]));', ["README.md"]],
+  ["tracked rename", () => {}, 'fs.renameSync("README.md", "renamed.md");', ["README.md", "renamed.md"]],
+  ["staged rename", () => {}, 'git(["mv", "README.md", "renamed.md"]);', ["README.md", "renamed.md"]],
+  ["mode-only edit", () => {}, 'fs.chmodSync("README.md", process.platform === "win32" ? 0o444 : 0o755);', ["README.md"]],
+  ["symlink replacement", (root) => symlinkSync("README.md", join(root, "link"), "file"), 'fs.unlinkSync("link"); fs.symlinkSync("src/widget.mjs", "link", "file");', ["link"]],
 
-  ["index-only staging", (root) => writeFileSync(join(root, "README.md"), "user draft\n"), "git add README.md", ["README.md"]],
-  ["PM board controls", () => {}, "echo '# tampered' >> docs/goals/one/state.yaml", ["docs/goals/one/state.yaml"]],
+  ["index-only staging", (root) => writeFileSync(join(root, "README.md"), "user draft\n"), 'git(["add", "README.md"]);', ["README.md"]],
+  ["PM board controls", () => {}, 'fs.appendFileSync("docs/goals/one/state.yaml", "# tampered");', ["docs/goals/one/state.yaml"]],
 ]) {
   test(`dispatch rejects ${name} from a read-only role`, () => {
     const root = makeProject({ taskType: "judge" });
     try {
       setup(root);
-      const bin = fakeHarnessBin(root, "codex", `${script}\necho '${RECEIPT}'`);
+      const bin = fakeHarnessBin(root, "codex", `${script}\nconsole.log(${JSON.stringify(RECEIPT)});`);
       const result = runDispatch(root, bin);
       assert.equal(result.status, 1, result.stdout);
       const actual = JSON.parse(result.stdout).scope_check.violations;
@@ -289,7 +282,7 @@ test("allowed dirty Worker writes leave unrelated dirty/untracked work untouched
     writeFileSync(join(root, "README.md"), "user draft\n");
     writeFileSync(join(root, "draft.txt"), "untracked draft\n");
     writeFileSync(join(root, "src/widget.mjs"), "// existing change\n");
-    const bin = fakeHarnessBin(root, "codex", `echo 'export const widget = 2;' >> src/widget.mjs\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("src/widget.mjs", "export const widget = 2;\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 0, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.changed_files, ["src/widget.mjs"]);
@@ -305,7 +298,7 @@ for (const file of ["state.yaml", "goal.md", "notes/acceptance-contract.json"]) 
     try {
       const statePath = join(root, "docs/goals/one/state.yaml");
       writeFileSync(statePath, readFileSync(statePath, "utf8").replace("- src/widget.mjs", "- docs/goals/one/**"));
-      const bin = fakeHarnessBin(root, "codex", `echo tampered >> docs/goals/one/${file}\necho '${RECEIPT}'`);
+      const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync(${JSON.stringify(`docs/goals/one/${file}`)}, "tampered\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
       const result = runDispatch(root, bin);
       assert.equal(result.status, 1, result.stdout);
       assert.deepEqual(JSON.parse(result.stdout).scope_check.violations, [`docs/goals/one/${file}`]);
@@ -318,7 +311,7 @@ test("non-Git dispatch fails scope inspection without starting the harness", () 
   const root = makeProject();
   try {
     rmSync(join(root, ".git"), { recursive: true });
-    const bin = fakeHarnessBin(root, "codex", `echo launched >> README.md\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("README.md", "launched\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     assert.equal(JSON.parse(result.stdout).scope_check.status, "unverifiable");
@@ -329,7 +322,7 @@ test("non-Git dispatch fails scope inspection without starting the harness", () 
 test("failed Git inspection after dispatch never becomes clean", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `echo partial >> README.md\nprintf corrupt > .git/index\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("README.md", "partial"); fs.writeFileSync(".git/index", "corrupt");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     const report = JSON.parse(result.stdout);
@@ -340,12 +333,12 @@ test("failed Git inspection after dispatch never becomes clean", () => {
 });
 
 for (const [name, script] of [
-  ["Git configuration", "git config example.changed yes"],
+  ["Git configuration", 'git(["config", "example.changed", "yes"]);'],
 ]) {
   test(`read-only dispatch detects changes to ${name}`, () => {
     const root = makeProject({ taskType: "scout" });
     try {
-      const bin = fakeHarnessBin(root, "codex", `${script}\necho '${RECEIPT}'`);
+      const bin = fakeHarnessBin(root, "codex", `${script}\nconsole.log(${JSON.stringify(RECEIPT)});`);
       const result = runDispatch(root, bin);
       assert.equal(result.status, 1, result.stdout);
       assert.equal(JSON.parse(result.stdout).scope_check.status, "violations");
@@ -359,7 +352,7 @@ test("Worker can create an allowed file and its missing parent directories", () 
   try {
     const board = join(root, "docs/goals/one/state.yaml");
     writeFileSync(board, readFileSync(board, "utf8").replace("- src/widget.mjs", "- src/new/widget.mjs"));
-    const bin = fakeHarnessBin(root, "codex", `mkdir src/new\necho 'export const widget = 2;' > src/new/widget.mjs\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.mkdirSync("src/new"); fs.writeFileSync("src/new/widget.mjs", "export const widget = 2;");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 0, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.changed_files, ["src/new", "src/new/widget.mjs"]);
@@ -371,7 +364,7 @@ test("read-only no-op preserves dirty tracked and untracked work", () => {
   try {
     writeFileSync(join(root, "README.md"), "existing work\n");
     writeFileSync(join(root, "draft.txt"), "existing draft\n");
-    const bin = fakeHarnessBin(root, "codex", `echo '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `console.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 0, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.changed_files, []);
@@ -383,7 +376,7 @@ test("read-only no-op preserves dirty tracked and untracked work", () => {
 test("Worker renames must keep both removed and added paths inside allowed_files", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `mv src/widget.mjs README.md\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.renameSync("src/widget.mjs", "README.md");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.violations, ["README.md"]);
@@ -394,14 +387,13 @@ test("Worker renames must keep both removed and added paths inside allowed_files
 test("custom goal directories remain protected outside docs/goals", () => {
   const root = makeProject();
   try {
-    const move = spawnSync("mv", ["docs/goals/one", "custom-goal"], { cwd: root, encoding: "utf8" });
-    assert.equal(move.status, 0, move.stderr);
+    renameSync(join(root, "docs/goals/one"), join(root, "custom-goal"));
     const board = join(root, "custom-goal/state.yaml");
     writeFileSync(board, readFileSync(board, "utf8").replace("- src/widget.mjs", "- custom-goal/**"));
-    const bin = fakeHarnessBin(root, "codex", `echo '# tampered' >> custom-goal/state.yaml\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("custom-goal/state.yaml", "# tampered\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = spawnSync(process.execPath, [dispatcher, "custom-goal", "--to", "codex", "--json"], {
       cwd: root, encoding: "utf8", timeout: 15000,
-      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
+      env: fixtureEnv(bin),
     });
     assert.equal(result.status, 1, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.violations, ["custom-goal/state.yaml"]);
@@ -411,10 +403,10 @@ test("custom goal directories remain protected outside docs/goals", () => {
 test("concurrent board changes during preflight prevent dispatch under stale authority", () => {
   const root = makeProject();
   try {
-    const gitPath = spawnSync("command", ["-v", "git"], { encoding: "utf8", shell: true }).stdout.trim();
-    const bin = fakeHarnessBin(root, "codex", `echo launched >> README.md\necho '${RECEIPT}'`);
+
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("README.md", "launched\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     // Simulate another writer during the first Git inspection, before its snapshot.
-    fakeHarnessBin(root, "git", `if [ "$1" = rev-parse ] && [ "$2" = --show-toplevel ]; then echo '# concurrent PM change' >> docs/goals/one/state.yaml; fi\nexec '${gitPath}' "$@"`);
+    fakeHarnessBin(root, "git", `if(args[0] === "rev-parse" && args[1] === "--show-toplevel") fs.appendFileSync("docs/goals/one/state.yaml", "# concurrent PM change\\n"); ${forwardGit}`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     assert.equal(JSON.parse(result.stdout).scope_check.status, "unverifiable");
@@ -430,7 +422,7 @@ test("separate Git directory pointer files are protected by content/state observ
   try {
     const moved = spawnSync("git", ["init", "--separate-git-dir", metadata], { cwd: root, encoding: "utf8" });
     assert.equal(moved.status, 0, moved.stderr);
-    const bin = fakeHarnessBin(root, "codex", `echo >> .git\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync(".git", "\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.violations, [".git"]);
@@ -445,10 +437,10 @@ test("a goal at the repository root still protects its board controls", () => {
   try {
     writeFileSync(join(root, "state.yaml"), readFileSync(join(root, "docs/goals/one/state.yaml"), "utf8").replace("- src/widget.mjs", "- state.yaml"));
     writeFileSync(join(root, "goal.md"), "# root goal\n");
-    const bin = fakeHarnessBin(root, "codex", `echo '# tampered' >> state.yaml\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("state.yaml", "# tampered\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = spawnSync(process.execPath, [dispatcher, ".", "--to", "codex", "--timeout", "5", "--json"], {
       cwd: root, encoding: "utf8", timeout: 15000,
-      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
+      env: fixtureEnv(bin),
     });
     assert.equal(result.status, 1, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.violations, ["state.yaml"]);
@@ -463,7 +455,7 @@ for (const change of [false, true]) {
     try {
       const linked = spawnSync("git", ["worktree", "add", "-q", "-b", "fixture", root], { cwd: main, encoding: "utf8" });
       assert.equal(linked.status, 0, linked.stderr);
-      const bin = fakeHarnessBin(root, "codex", `${change ? "echo changed >> README.md" : "git status --porcelain >/dev/null"}\necho '${RECEIPT}'`);
+      const bin = fakeHarnessBin(root, "codex", `${change ? 'fs.appendFileSync("README.md", "changed");' : 'git(["status", "--porcelain"]);'}\nconsole.log(${JSON.stringify(RECEIPT)});`);
       const result = runDispatch(root, bin);
       assert.equal(result.status, change ? 1 : 0, result.stdout || result.stderr);
       const report = JSON.parse(result.stdout);
@@ -479,11 +471,22 @@ for (const target of ["node_modules/.cache/big", ".git/objects/sparse-file"]) {
     try {
       writeFileSync(join(root, ".gitignore"), "node_modules/\n");
       mkdirSync(join(root, target, ".."), { recursive: true });
-      const fd = openSync(join(root, target), "w"); ftruncateSync(fd, 513 * 1024 * 1024); closeSync(fd);
-      assert.equal(statSync(join(root, target)).blocks, 0);
-      const bin = fakeHarnessBin(root, "codex", `echo '${RECEIPT}'`);
-      const result = runDispatch(root, bin);
-      assert.equal(result.status, 0, result.stdout);
+      const fd = openSync(join(root, target), "w");
+      // Windows allocation is not POSIX sparse allocation. The read guard below
+      // proves the exclusion without allocating a large native Windows payload.
+      const size = process.platform === "win32" ? 1024 : 513 * 1024 * 1024;
+      ftruncateSync(fd, size); closeSync(fd);
+      assert.equal(statSync(join(root, target)).size, size);
+      const bin = fakeHarnessBin(root, "codex", `console.log(${JSON.stringify(RECEIPT)});`);
+      const guard = join(bin, "deny-read.cjs");
+      writeFileSync(guard, `const fs = require('node:fs'), path = require('node:path'); const open = fs.openSync, target = fs.realpathSync.native(${JSON.stringify(join(root,target))});
+fs.openSync = (file, ...args) => { if(fs.realpathSync.native(file) === target) throw new Error('excluded payload was read'); return open(file, ...args); };
+require('node:module').syncBuiltinESMExports();`);
+      const env = fixtureEnv(bin); env.NODE_OPTIONS += ` --require="${guard.replaceAll("\\", "/")}"`;
+      const control = spawnSync(process.execPath, ["-e", `require('node:fs').openSync(${JSON.stringify(join(root,target))}, 'r')`], {env, encoding:"utf8"});
+      assert.equal(control.status, 1); assert.match(control.stderr, /excluded payload was read/);
+      const result = spawnSync(process.execPath, [dispatcher, "docs/goals/one", "--to", "codex", "--json"], {cwd:root, env, encoding:"utf8", timeout:15000});
+      assert.equal(result.status, 0, result.stdout || result.stderr);
       const observation = JSON.parse(result.stdout).scope_check.observation;
       assert.equal(observation.policy, "source-and-controls-v1");
       assert.ok(observation.git_exclusions.includes("object database"));
@@ -498,11 +501,11 @@ test("git status cache refresh is clean while semantic index flags remain observ
     utimesSync(join(root, "README.md"), new Date(0), new Date(0));
     const semantic = () => spawnSync("git", ["ls-files", "--stage", "-v"], { cwd: root, encoding: "utf8" }).stdout;
     const before = semantic();
-    const bin = fakeHarnessBin(root, "codex", `test "$GIT_OPTIONAL_LOCKS" = 0 || exit 42\nGIT_OPTIONAL_LOCKS=1 git status --porcelain >/dev/null\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `if (process.env.GIT_OPTIONAL_LOCKS !== "0") process.exit(42); git(["status", "--porcelain"], {env: {...process.env, GIT_OPTIONAL_LOCKS: "1"}}); console.log(${JSON.stringify(RECEIPT)});`);
     const status = runDispatch(root, bin);
     assert.equal(status.status, 0, status.stdout);
     assert.equal(semantic(), before);
-    fakeHarnessBin(root, "codex", `git update-index --assume-unchanged README.md\necho '${RECEIPT}'`);
+    fakeHarnessBin(root, "codex", `git(["update-index", "--assume-unchanged", "README.md"]);\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const flags = runDispatch(root, bin);
     assert.equal(flags.status, 1, flags.stdout);
     assert.deepEqual(JSON.parse(flags.stdout).scope_check.violations, ["README.md"]);
@@ -519,7 +522,7 @@ for (const admitted of [false, true]) {
         const path = join(root, "docs/goals/one/state.yaml");
         writeFileSync(path, readFileSync(path, "utf8").replace("    receipt: null", "    inputs:\n      - generated/result.txt\n    receipt: null"));
       }
-      const bin = fakeHarnessBin(root, "codex", `echo changed >> generated/result.txt\necho '${RECEIPT}'`);
+      const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("generated/result.txt", "changed\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
       const result = runDispatch(root, bin), report = JSON.parse(result.stdout);
       assert.equal(result.status, admitted ? 1 : 0, result.stdout);
       assert.ok(report.scope_check.observation.excluded_ignored_paths.includes("generated/"));
@@ -536,7 +539,7 @@ test("ignored PM controls cannot disappear from source observation", () => {
   try {
     writeFileSync(join(root, ".gitignore"), "docs/goals/**/notes/\n");
     writeFileSync(join(root, "docs/goals/one/notes/proof.json"), "{}");
-    const bin = fakeHarnessBin(root, "codex", `echo tampered >> docs/goals/one/notes/proof.json\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("docs/goals/one/notes/proof.json", "tampered\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.violations, ["docs/goals/one/notes/proof.json"]);
@@ -551,7 +554,7 @@ test("explicit glob grants observe nested ignored source paths", () => {
     writeFileSync(join(root, "generated/nested/deeper/result.txt"), "before");
     const path = join(root, "docs/goals/one/state.yaml");
     writeFileSync(path, readFileSync(path, "utf8").replace("src/widget.mjs", "generated/**/*.txt"));
-    const bin = fakeHarnessBin(root, "codex", `echo changed >> generated/nested/deeper/result.txt\necho '${RECEIPT}'`);
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("generated/nested/deeper/result.txt", "changed\\n");\nconsole.log(${JSON.stringify(RECEIPT)});`);
     const result = runDispatch(root, bin), report = JSON.parse(result.stdout);
     assert.equal(result.status, 1, result.stdout);
     assert.ok(report.scope_check.observation.admitted_ignored_paths.includes("generated/nested/deeper/result.txt"));
@@ -565,8 +568,8 @@ test("root-level goal permits explicitly allowed source edits", () => {
     writeFileSync(join(root, "state.yaml"), readFileSync(join(root, "docs/goals/one/state.yaml")));
     writeFileSync(join(root, "goal.md"), "# root goal\n");
     const receipt = JSON.parse(RECEIPT); receipt.goalbuddy_receipt_v1.board_path = "state.yaml";
-    const bin = fakeHarnessBin(root, "codex", `echo '// allowed' >> src/widget.mjs\necho '${JSON.stringify(receipt)}'`);
-    const result = spawnSync(process.execPath, [dispatcher, ".", "--to", "codex", "--timeout", "5", "--json"], { cwd: root, encoding: "utf8", timeout: 15000, env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` } });
+    const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("src/widget.mjs", "// allowed\\n");\nconsole.log(${JSON.stringify(JSON.stringify(receipt))});`);
+    const result = spawnSync(process.execPath, [dispatcher, ".", "--to", "codex", "--timeout", "5", "--json"], { cwd: root, encoding: "utf8", timeout: 15000, env: fixtureEnv(bin) });
     assert.equal(result.status, 0, result.stdout || result.stderr);
     assert.deepEqual(JSON.parse(result.stdout).scope_check.changed_files, ["src/widget.mjs"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -577,7 +580,7 @@ for (const [field, value] of [["task_id", "T777"], ["board_path", "docs/goals/un
     const root = makeProject();
     try {
       const receipt = JSON.parse(RECEIPT); receipt.goalbuddy_receipt_v1[field] = value;
-      const bin = fakeHarnessBin(root, "codex", `echo '${JSON.stringify(receipt)}'`);
+      const bin = fakeHarnessBin(root, "codex", `console.log(${JSON.stringify(JSON.stringify(receipt))});`);
       const result = runDispatch(root, bin), report = JSON.parse(result.stdout);
       assert.equal(result.status, 1, result.stdout);
       assert.equal(report.ok, false);
@@ -590,9 +593,57 @@ for (const [field, value] of [["task_id", "T777"], ["board_path", "docs/goals/un
 test("duplicate JSON receipt members cannot be hidden by the envelope or bare fallback", () => {
   const root = makeProject();
   try {
-    const bin = fakeHarnessBin(root, "codex", `echo '{"goalbuddy_receipt_v1":{"result":"blocked","result":"done","task_id":"T001"}}'`);
+    const bin = fakeHarnessBin(root, "codex", `console.log('{"goalbuddy_receipt_v1":{"result":"blocked","result":"done","task_id":"T001"}}');`);
     const result = runDispatch(root, bin);
     assert.equal(result.status, 1, result.stdout);
     assert.match(JSON.parse(result.stdout).error, /Duplicate JSON/);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const role of ["worker", "scout"]) {
+  test(`canonical workspace alias preserves ${role} scope authority`, () => {
+    const root = makeProject({taskType:role}), alias = root + "-alias";
+    try {
+      symlinkSync(realpathSync.native(root), alias, process.platform === "win32" ? "junction" : "dir");
+      const before = gitSnapshot(alias, {boardPath:join(alias,"docs/goals/one/state.yaml"), admitted:["src/widget.mjs"]});
+      assert.equal(before.ok, true, before.error);
+      assert.equal(before.root, realpathSync.native(root));
+      assert.ok(before.files.has("docs/goals/one/state.yaml"));
+      const bin = fakeHarnessBin(root, "codex", `fs.appendFileSync("src/widget.mjs", "changed"); console.log(${JSON.stringify(RECEIPT)});`);
+      const result = runDispatch(alias, bin), report = JSON.parse(result.stdout);
+      assert.equal(result.status, role === "worker" ? 0 : 1, result.stdout || result.stderr);
+      assert.deepEqual(report.scope_check.changed_files, ["src/widget.mjs"]);
+      assert.deepEqual(report.scope_check.violations, role === "worker" ? [] : ["src/widget.mjs"]);
+      assert.equal(readFileSync(join(root,"src/widget.mjs"),"utf8"), "export const widget = 1;\nchanged");
+    } finally { rmSync(alias,{recursive:true,force:true}); rmSync(root,{recursive:true,force:true}); }
+  });
+}
+
+test("canonical identity retains outside-root, cross-drive and source-link rejection", () => {
+  const root = makeProject(), outside = mkdtempSync(join(tmpdir(), "goalbuddy-outside-"));
+  try {
+    const snapshot = gitSnapshot(root, {boardPath:join(outside,"state.yaml")});
+    assert.equal(snapshot.ok, false);
+    assert.equal(insidePath(root, outside), false);
+    if (process.platform === "win32") assert.equal(insidePath("C:\\source", "D:\\source\\file"), false);
+    symlinkSync(outside, join(root,"escape"), process.platform === "win32" ? "junction" : "dir");
+    assert.throws(() => localPath(root, "escape/result.txt"), /Symlink/);
+    assert.throws(() => localPath(root, "../outside"), /relative local/);
+  } finally { rmSync(root,{recursive:true,force:true}); rmSync(outside,{recursive:true,force:true}); }
+});
+
+test("native fixture bootstrap preserves Git subcommand argv and executes its callback", () => {
+  const root = makeProject();
+  try {
+    const bin = fakeHarnessBin(root,"git", `fs.writeFileSync("callback-argv.json",JSON.stringify(args)); ${forwardGit}`);
+    // Exercise Node's native-executable preload entry on every host. The actual
+    // Windows suites launch the copied .exe; this isolates Node's argv expansion.
+    const preload = join(bin,"native-entry.cjs");
+    writeFileSync(preload, `process.execPath = ${JSON.stringify(join(bin,"git.exe"))}; require(${JSON.stringify(join(bin,"bootstrap.cjs"))});`);
+    const result = spawnSync(process.execPath,["rev-parse","--show-toplevel"],{cwd:root,encoding:"utf8",timeout:5000,
+      env:{...process.env,NODE_OPTIONS:`--require="${preload.replaceAll("\\","/")}"`}});
+    assert.equal(result.status,0,result.stdout || result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(root,"callback-argv.json"))),["rev-parse","--show-toplevel"]);
+    assert.equal(realpathSync.native(result.stdout.trim()),realpathSync.native(root));
+  } finally { rmSync(root,{recursive:true,force:true}); }
 });

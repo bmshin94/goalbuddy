@@ -86,7 +86,7 @@ try {
   const command = args.slice(separator + 1);
   if (canonical(command) !== canonical(before.config.command)) throw new Error("Explicit command does not match the task's declared acceptance command; nothing was executed.");
   const started = new Date().toISOString();
-  const observed = await run(command, before.workspace, before.timeout);
+  const observed = await run(before.launch.command, before.workspace, before.timeout);
   try {
     const after = acceptanceContext(statePath, bytes, before.audit.id);
     if (canonical(before.binding) !== canonical(after.binding)) observed.error = "Acceptance changed its outcome, validator, or declared inputs; evidence is stale.";

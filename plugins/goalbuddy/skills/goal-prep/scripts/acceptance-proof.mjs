@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { canonical, parseBoard, parseJson } from "./strict-data.mjs";
 import { insidePath, localPath, portable, sha256, snapshotPaths } from "./file-snapshot.mjs";
@@ -52,10 +52,17 @@ function unresolvedEntry(detail) {
   throw new Error(`${detail} Use a direct local validator command with its concrete filename; declare additional dependencies in acceptance.inputs.`);
 }
 
+// Windows executable aliases ignore letter case; POSIX program names do not.
+function nodeCommandName(executable, platform = process.platform) {
+  const name = executable.split(/[\\/]/).at(-1);
+  return (platform === "win32" ? /^node(?:\.exe)?$/i : /^node(?:\.exe)?$/).test(name);
+}
+
 // One literal shell command only, as used in package scripts. Quotes and escaped
 // spaces are words, not separators. Only ASCII space/tab separate words;
 // Unicode whitespace stays literal. Expansion/composition is deliberately absent.
-function literalCommand(text) {
+export function literalCommand(text, platform = process.platform) {
+  if (platform === "win32") return windowsLiteralCommand(text);
   const words = [];
   let word = "", quote = null, started = false;
   const flush = () => { if (started) words.push(word); word = ""; started = false; };
@@ -83,7 +90,82 @@ function literalCommand(text) {
   return words;
 }
 
-function localCommandFiles(command, root) {
+// cmd.exe does not use POSIX single quotes or backslash escapes. Admit only
+// whole literal words or whole double-quoted words, with no cmd expansion.
+function windowsLiteralCommand(text) {
+  if (/^[ \t]*"/.test(text)) unresolvedEntry("Native Windows npm scripts need an unquoted executable word such as node; quoted executable paths need direct Node argv.");
+  if (/[\x00-\x08\x0a-\x1f%!'`$^&|<>()*?\[\]{}~;]/u.test(text)) unresolvedEntry("Unsupported native Windows package-command expansion, escaping, or composition.");
+  const words = [];
+  for (let index = 0; index < text.length;) {
+    while (/[ \t]/.test(text[index] || "") && index < text.length) index++;
+    if (index === text.length) break;
+    let word = "";
+    if (text[index] === '"') {
+      index++;
+      while (index < text.length && text[index] !== '"') word += text[index++];
+      // A backslash before the closing quote has special argv meaning in Node.
+      if (index === text.length || word.endsWith("\\")) unresolvedEntry("Unsupported native Windows package-command quote/escape.");
+      index++;
+      if (index < text.length && !/[ \t]/.test(text[index])) unresolvedEntry("Native Windows package-command quotes must enclose a whole word.");
+    } else {
+      while (index < text.length && !/[ \t]/.test(text[index])) {
+        if (text[index] === '"') unresolvedEntry("Native Windows package-command quotes must enclose a whole word.");
+        word += text[index++];
+      }
+      if (word.endsWith("\\")) unresolvedEntry("Unsupported native Windows package-command escape or directory operand.");
+    }
+    words.push(word);
+  }
+  if (!words.length || !words[0] || words[0].includes("=")) unresolvedEntry("Package-command assignments or empty commands are unsupported.");
+  if (words[0].startsWith("@") || !nodeCommandName(words[0], "win32")) unresolvedEntry("Native Windows npm scripts must launch unquoted node or a path to node.exe; use direct argv for other local native executables.");
+  return words;
+}
+
+const isPackageLauncher = command => /^(npm|pnpm|yarn)(\.cmd)?$/.test(basename(command[0]));
+
+// Windows npm.cmd is not a native executable. Use this Node installation's npm
+// JS entry with literal argv, and explicitly select the shell whose grammar we
+// inspect. Other npm shims/managers need direct concrete Node argv recovery.
+export function acceptanceLaunch(command, workspace) {
+  if (process.platform !== "win32" || !isPackageLauncher(command)) return { command };
+  if (!['npm', 'npm.cmd'].includes(command[0])) unresolvedEntry("Native Windows package acceptance supports the bundled npm launcher only.");
+  const cli = join(dirname(process.execPath), "node_modules/npm/bin/npm-cli.js");
+  const shell = join(process.env.SystemRoot || "C:\\Windows", "System32/cmd.exe");
+  if (!existsSync(cli) || !lstatSync(cli).isFile() || !existsSync(shell)) unresolvedEntry("Cannot establish bundled npm and native cmd.exe for acceptance.");
+  // No shell handles these argv. Shell selection/workspace cannot be redirected
+  // by a user/project npm config file; the declared launcher grammar rejects overrides.
+  const argv = [process.execPath, cli, `--prefix=${workspace}`, "--global=false", "--workspaces=false", `--script-shell=${shell}`, ...command.slice(1)];
+  return { command: argv, identity: { kind: "windows_bundled_npm", node: realpathSync.native(process.execPath), npm_cli: realpathSync.native(cli), npm_cli_sha256: sha256(readFileSync(cli)), argv, script_shell: realpathSync.native(shell) } };
+}
+
+function windowsScriptExecutable(executable, root, launch) {
+  if (isAbsolute(executable) || /[\\/]/.test(executable)) {
+    const path = resolve(root, executable);
+    if (!existsSync(path) || !lstatSync(path).isFile()) unresolvedEntry("Native Windows package executable must name an exact file.");
+    return path;
+  }
+  // npm prepends ancestor node_modules/.bin directories and its node-gyp bin.
+  // Ask native where.exe to resolve that PATH (including cwd/PATHEXT), rather
+  // than assuming that a literal `node` cannot be shadowed by a local shim.
+  const bins = [];
+  for (let dir = root;; dir = dirname(dir)) {
+    bins.push(join(dir, "node_modules/.bin"));
+    if (dirname(dir) === dir) break;
+  }
+  bins.push(resolve(dirname(launch.identity.npm_cli), "../node_modules/@npmcli/run-script/lib/node-gyp-bin"));
+  const env = { ...process.env };
+  const pathKeys = Object.keys(env).filter(key => /^path$/i.test(key));
+  const paths = pathKeys.flatMap(key => env[key].split(delimiter));
+  for (const key of pathKeys) delete env[key];
+  env.PATH = [...bins, ...paths].join(delimiter);
+  const located = spawnSync(join(dirname(launch.identity.script_shell), "where.exe"), [executable], { cwd: root, env, encoding: "utf8", timeout: 5000, windowsHide: true });
+  const first = located.stdout?.trim().split(/\r?\n/)[0];
+  if (located.error || located.status !== 0 || !first || !existsSync(first)) unresolvedEntry("Cannot establish the native Windows package executable.");
+  // Retain the lexical local path so source symlinks remain visible to snapshots.
+  return first;
+}
+
+function localCommandFiles(command, root, launch) {
   const files = new Set();
   const add = value => {
     if (typeof value !== "string" || !value || value.startsWith("-")) return false;
@@ -100,22 +182,27 @@ function localCommandFiles(command, root) {
     const path = local(resolve(root, value));
     // Bind exactly the file operand. Do not emulate Node's directory, main or
     // extension search (including a file that shadows a directory launch).
-    if (value.endsWith("/") || !existsSync(path) || !lstatSync(path).isFile()) unresolvedEntry(`Node entry point is not an exact local file: ${value}.`);
+    if ((/[\\/]$/.test(value) && process.platform === "win32") || value.endsWith("/") || !existsSync(path) || !lstatSync(path).isFile()) unresolvedEntry(`Node entry point is not an exact local file: ${value}.`);
     add(path);
   };
-  const collect = (argv, allowPackageLauncher = false) => {
+  const collect = (argv, allowPackageLauncher = false, fromPackageScript = false) => {
     for (const arg of argv) add(arg.includes("=") && arg.startsWith("--") ? arg.slice(arg.indexOf("=") + 1) : arg);
-    let executable = argv[0];
+    let executable = fromPackageScript && launch.identity ? windowsScriptExecutable(argv[0], root, launch) : argv[0];
     if (!executable.includes("/") && !isAbsolute(executable)) {
       for (const directory of (process.env.PATH || "").split(delimiter)) {
         const candidate = resolve(directory, executable);
         if (existsSync(candidate)) { executable = candidate; break; }
       }
     }
+    if (process.platform === "win32" && !allowPackageLauncher && /\.(?:cmd|bat|sh)$/i.test(executable)) unresolvedEntry("Native Windows verification requires Node argv or an exact native executable, not a shell script.");
     const localExecutable = add(executable);
-    const node = /^(node|node\.exe)$/.test(argv[0].split(/[\\/]/).at(-1))
-      || (existsSync(executable) && realpathSync(executable) === realpathSync(process.execPath));
+    const node = nodeCommandName(argv[0])
+      || (existsSync(executable) && realpathSync.native(executable) === realpathSync.native(process.execPath));
+    // Windows package admission already permits only Node; never let name
+    // classification turn a different runtime into a generic executable.
+    if (fromPackageScript && launch.identity && realpathSync.native(executable) !== realpathSync.native(process.execPath)) unresolvedEntry("Native Windows package Node is shadowed or differs from the recorder runtime.");
     if (!node) {
+      if (process.platform === "win32" && !allowPackageLauncher && !/\.(?:exe|com)$/i.test(executable)) unresolvedEntry("Native Windows verification requires Node argv or an exact native executable.");
       if (!localExecutable && !allowPackageLauncher) unresolvedEntry("Verification must launch Node, a supported package script, or an exact local executable.");
       return;
     }
@@ -136,7 +223,7 @@ function localCommandFiles(command, root) {
     }
     nodeEntry(argv[index]);
   };
-  const packageLauncher = /^(npm|pnpm|yarn)(\.cmd)?$/.test(command[0].split(/[\\/]/).at(-1));
+  const packageLauncher = isPackageLauncher(command);
   collect(command, packageLauncher);
   // Common package launchers expose their local entry point in package.json.
   if (packageLauncher) {
@@ -144,18 +231,19 @@ function localCommandFiles(command, root) {
     files.add("package.json");
     for (const name of ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"]) if (existsSync(join(root, name))) files.add(name);
     const script = packageScript(command);
+    if (launch.identity && command.slice(1).some(arg => !/^[A-Za-z0-9_./:=+-]+$/.test(arg))) unresolvedEntry("Native Windows package launcher arguments must be literal option/script words.");
     if (typeof pkg.scripts?.[script] !== "string" || !pkg.scripts[script].trim()) throw new Error(`Package acceptance script ${script} must be explicitly declared in package.json; use a direct local validator for implicit launcher behavior.`);
     // Lifecycle hooks are also obvious local verification entry points. Binding
     // them conservatively is safe even when a launcher suppresses its hooks.
     for (const name of [`pre${script}`, script, `post${script}`]) {
-      if (typeof pkg.scripts?.[name] === "string") collect(literalCommand(pkg.scripts[name]));
+      if (typeof pkg.scripts?.[name] === "string") collect(literalCommand(pkg.scripts[name]), false, true);
     }
   }
   return [...files].sort();
 }
 
 export function acceptanceContext(statePath, bytes, taskId) {
-  statePath = realpathSync(statePath);
+  statePath = realpathSync.native(statePath);
   const goalRoot = dirname(statePath);
   const board = parseBoard(Buffer.from(bytes).toString("utf8"));
   const audit = taskId ? board.tasks.find(task => task.id === taskId) : board.tasks.filter(task => ["judge", "pm"].includes(task.type)).at(-1);
@@ -171,14 +259,15 @@ export function acceptanceContext(statePath, bytes, taskId) {
   let workspace;
   if (config.workspace !== undefined) {
     if (typeof config.workspace !== "string" || !config.workspace) throw new Error("acceptance.workspace must name the authorized workspace relative to the goal directory.");
-    workspace = realpathSync(resolve(goalRoot, config.workspace));
+    workspace = realpathSync.native(resolve(goalRoot, config.workspace));
   } else {
     const git = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: goalRoot, encoding: "utf8", timeout: 30000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
     if (git.error || git.status !== 0) throw new Error("Cannot establish acceptance workspace; non-Git goals must explicitly set task.acceptance.workspace.");
-    workspace = realpathSync(git.stdout.trim());
+    workspace = realpathSync.native(git.stdout.trim());
   }
   if (!insidePath(workspace, goalRoot)) throw new Error("Goal must be inside the authorized acceptance workspace.");
-  const code = localCommandFiles(config.command, workspace);
+  const launch = acceptanceLaunch(config.command, workspace);
+  const code = localCommandFiles(config.command, workspace, launch);
   const taskInputs = (audit.inputs || []).filter(value => typeof value === "string" && existsSync(resolve(workspace, value)));
   const inputs = [...new Set([...config.artifacts, ...(config.inputs || []), ...taskInputs, ...code])].sort();
   const paths = inputs.map(path => {
@@ -192,10 +281,11 @@ export function acceptanceContext(statePath, bytes, taskId) {
     workspace, state_path: portable(relative(workspace, statePath)), task_id: audit.id,
     subject_sha256: sha256(canonical(subject(board, audit.id))),
     charter_sha256: sha256(readFileSync(localPath(goalRoot, "goal.md"))),
+    ...(launch.identity ? { launcher: launch.identity } : {}),
     inputs, local_entry_points: code, inputs_sha256: sha256(canonical([...snapshots])),
   };
   assertBoardRevision(statePath, bytes);
-  return { board, audit, config, timeout, workspace, goalRoot, binding };
+  return { board, audit, config, timeout, workspace, goalRoot, binding, launch };
 }
 
 function validateOutput(output) {
@@ -217,7 +307,7 @@ export function checkAcceptanceProof(statePath, bytes) {
     if (last?.result !== "pass" || last.task !== audit.id) throw new Error("Acceptance contradicts missing/non-passing last_verification or its audit task.");
     for (const commands of [last.commands, receipt.commands]) if (commands !== undefined && (!Array.isArray(commands) || commands.some(command => command?.status !== "pass"))) throw new Error("Acceptance contradicts non-passing verification/audit commands.");
     if (typeof receipt.acceptance_proof !== "string" || !/^notes\/acceptance-[A-Za-z0-9_-]+\.json$/.test(receipt.acceptance_proof)) throw new Error("Missing final audit acceptance_proof; historical claims are unverified.");
-    const proofPath = localPath(dirname(realpathSync(statePath)), receipt.acceptance_proof);
+    const proofPath = localPath(dirname(realpathSync.native(statePath)), receipt.acceptance_proof);
     const proofBytes = readFileSync(proofPath);
     const proof = parseJson(proofBytes.toString("utf8"));
     if (proof.version !== 2 || proof.result !== "pass" || proof.exit_status !== 0 || proof.signal !== null || proof.error !== null || proof.timed_out !== false

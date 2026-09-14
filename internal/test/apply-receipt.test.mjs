@@ -1,8 +1,9 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { fakeCommandBin, fixtureEnv } from "./core-fixtures.mjs";
 import assert from "node:assert/strict";
 
 const script = resolve("goalbuddy/scripts/apply-receipt.mjs");
@@ -142,12 +143,12 @@ for (const status of ["violations", "unverifiable", "skipped_not_git"]) {
 
 function realDispatch(root) {
   mkdirSync(join(root, "src")); writeFileSync(join(root, "src/widget.mjs"), "export const widget = 1;\n");
-  const bin = join(root, "fake-bin"); mkdirSync(bin);
-  writeFileSync(join(bin, "codex"), `#!/bin/sh\necho 'export const widget = 2;' > src/widget.mjs\necho '${JSON.stringify({ goalbuddy_receipt_v1: DONE_RECEIPT })}'\n`); chmodSync(join(bin, "codex"), 0o755);
+  const bin = join(root, "fake-bin");
   for (const args of [["init", "-q"], ["add", "-A"], ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]]) {
     const result = spawnSync("git", args, { cwd: root, encoding: "utf8" }); assert.equal(result.status, 0, result.stderr);
   }
-  const run = spawnSync(process.execPath, [resolve("goalbuddy/scripts/dispatch-task.mjs"), "docs/goals/one", "--to", "codex", "--timeout", "5", "--json"], { cwd: root, encoding: "utf8", timeout: 15000, env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` } });
+  fakeCommandBin(root, "codex", `fs.writeFileSync("src/widget.mjs", "export const widget = 2;\\n"); console.log(${JSON.stringify(JSON.stringify({ goalbuddy_receipt_v1: DONE_RECEIPT }))});`);
+  const run = spawnSync(process.execPath, [resolve("goalbuddy/scripts/dispatch-task.mjs"), "docs/goals/one", "--to", "codex", "--timeout", "5", "--json"], { cwd: root, encoding: "utf8", timeout: 15000, env: fixtureEnv(bin) });
   assert.equal(run.status, 0, run.stdout || run.stderr);
   return JSON.parse(run.stdout);
 }
@@ -218,4 +219,22 @@ test("duplicate JSON import members reject before identity stripping", () => {
     assert.match(result.stderr, /Duplicate JSON/);
     assert.deepEqual(readFileSync(join(goalDir, "state.yaml")), before);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("receipt authority accepts canonical board aliases and rejects a different board", () => {
+  const { root, goalDir } = makeBoard(), alias = root + "-alias";
+  try {
+    symlinkSync(realpathSync.native(root), alias, process.platform === "win32" ? "junction" : "dir");
+    const report = realDispatch(root);
+    report.cwd = alias; report.repository_root = alias;
+    report.board_path = join(alias,"docs/goals/one/state.yaml");
+    report.receipt.board_path = report.board_path;
+    const before = readFileSync(join(goalDir,"state.yaml"));
+    const wrong = {...report, board_path:join(alias,"docs/goals/one/goal.md")};
+    const rejected = runApply(root, ["--task","T001","--activate","T999"], wrong);
+    assert.equal(rejected.status,1); assert.match(rejected.stderr,/board_path/);
+    assert.deepEqual(readFileSync(join(goalDir,"state.yaml")),before);
+    const result = runApply(root, ["--task","T001","--activate","T999"], report);
+    assert.equal(result.status,0,result.stdout || result.stderr);
+  } finally { rmSync(alias,{recursive:true,force:true}); rmSync(root,{recursive:true,force:true}); }
 });
