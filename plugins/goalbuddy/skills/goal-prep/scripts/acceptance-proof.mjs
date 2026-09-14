@@ -167,26 +167,47 @@ function windowsScriptExecutable(executable, root, launch) {
 
 function localCommandFiles(command, root, launch) {
   const files = new Set();
+  const local = value => {
+    // Parent traversal can cross a source link before the OS resolves it.
+    // Reject it rather than erase the link with lexical normalization.
+    if (value.split(/[\\/]/).includes("..")) unresolvedEntry("An exact local command path cannot contain parent traversal.");
+    const path = resolve(root, value);
+    if (insidePath(root, path)) return path;
+    // Absolute command paths can retain a different spelling of the workspace
+    // (Windows 8.3 names, or a root directory alias). Resolve only the root
+    // prefix; localPath must still inspect every source descendant for links.
+    const parents = [];
+    for (let parent = dirname(path);; parent = dirname(parent)) {
+      parents.unshift(parent);
+      if (dirname(parent) === parent) break;
+    }
+    // Outermost match matters: a link inside an aliased workspace back to its
+    // root must remain a source link, not become another trusted root prefix.
+    const alias = parents.find(parent => existsSync(parent) && realpathSync.native(parent) === root);
+    return alias ? resolve(root, relative(alias, path)) : null;
+  };
   const add = value => {
     if (typeof value !== "string" || !value || value.startsWith("-")) return false;
-    const path = resolve(root, value);
-    if (!insidePath(root, path) || !existsSync(path) || lstatSync(path).isDirectory()) return false;
+    const path = local(value);
+    if (!path || !existsSync(path) || lstatSync(path).isDirectory()) return false;
+    localPath(root, portable(relative(root, path)));
     files.add(portable(relative(root, path))); return true;
-  };
-  const local = path => {
-    if (!insidePath(root, path)) unresolvedEntry("Node entry point escapes the authorized workspace.");
-    return localPath(root, portable(relative(root, path)) || ".");
   };
   const nodeEntry = value => {
     if (!value) unresolvedEntry("Node needs a concrete entry point.");
-    const path = local(resolve(root, value));
+    const path = local(value);
+    if (!path) unresolvedEntry("Node entry point escapes the authorized workspace.");
+    localPath(root, portable(relative(root, path)) || ".");
     // Bind exactly the file operand. Do not emulate Node's directory, main or
     // extension search (including a file that shadows a directory launch).
     if ((/[\\/]$/.test(value) && process.platform === "win32") || value.endsWith("/") || !existsSync(path) || !lstatSync(path).isFile()) unresolvedEntry(`Node entry point is not an exact local file: ${value}.`);
     add(path);
   };
   const collect = (argv, allowPackageLauncher = false, fromPackageScript = false) => {
-    for (const arg of argv) add(arg.includes("=") && arg.startsWith("--") ? arg.slice(arg.indexOf("=") + 1) : arg);
+    const addArguments = start => {
+      for (const arg of argv.slice(start)) add(arg.includes("=") && arg.startsWith("--") ? arg.slice(arg.indexOf("=") + 1) : arg);
+    };
+    add(argv[0]);
     let executable = fromPackageScript && launch.identity ? windowsScriptExecutable(argv[0], root, launch) : argv[0];
     if (!executable.includes("/") && !isAbsolute(executable)) {
       for (const directory of (process.env.PATH || "").split(delimiter)) {
@@ -202,26 +223,46 @@ function localCommandFiles(command, root, launch) {
     // classification turn a different runtime into a generic executable.
     if (fromPackageScript && launch.identity && realpathSync.native(executable) !== realpathSync.native(process.execPath)) unresolvedEntry("Native Windows package Node is shadowed or differs from the recorder runtime.");
     if (!node) {
+      addArguments(1);
       if (process.platform === "win32" && !allowPackageLauncher && !/\.(?:exe|com)$/i.test(executable)) unresolvedEntry("Native Windows verification requires Node argv or an exact native executable.");
       if (!localExecutable && !allowPackageLauncher) unresolvedEntry("Verification must launch Node, a supported package script, or an exact local executable.");
       return;
     }
-    let index = 1;
+    const printEqualsRecovery = "The Node --print= option is unsupported. Use separate --print <literal code> or --eval <literal code>, or node checks/run.mjs for a concrete validator.";
+    let index = 1, inline = false;
     for (; index < argv.length; index++) {
       const arg = argv[index];
       if (["--no-warnings", "--trace-warnings"].includes(arg)) continue;
       if (arg === "--") { index++; break; }
+      const inlineOption = ["-e", "--eval", "-p", "--print"].includes(arg);
+      if (arg.startsWith("--print=") || (inlineOption && argv[index + 1]?.startsWith("--print="))) unresolvedEntry(printEqualsRecovery);
       // Literal inline code is already bound by argv/package metadata. Its
       // imports remain explicitly declared dependencies, not inferred entries.
-      if (["-e", "--eval", "-p", "--print"].includes(arg)) {
+      if (inlineOption) {
         if (typeof argv[index + 1] !== "string") unresolvedEntry("Missing literal Node inline code.");
-        return;
+        if (argv[index + 1].startsWith("-")) unresolvedEntry("Node inline verification needs a literal code operand; use --eval=<literal code> or node checks/run.mjs.");
+        index++; inline = true;
+        continue;
       }
-      if (arg.startsWith("--eval=") || arg.startsWith("--print=")) return;
-      if (arg.startsWith("-")) unresolvedEntry(`Unsupported Node entry-point option: ${arg}.`);
+      if (arg.startsWith("--eval=")) { inline = true; continue; }
+      if (arg.startsWith("-")) {
+        if (!inline) unresolvedEntry(`Unsupported Node entry-point option: ${arg}.`);
+        // Keep the existing ordinary operand inference after inline code.
+        if (arg.includes("=")) add(arg.slice(arg.indexOf("=") + 1));
+        continue;
+      }
       break;
     }
-    nodeEntry(argv[index]);
+    if (inline) {
+      // Unresolved post-inline option/operand pairs may still contain Node
+      // options. Require an explicit -- before option-like argument data.
+      const boundary = argv.indexOf("--", index);
+      if (argv[index - 1] !== "--" && argv.slice(index, boundary < 0 ? argv.length : boundary).some(arg => arg.startsWith("--print="))) unresolvedEntry(printEqualsRecovery);
+      addArguments(index);
+    } else {
+      nodeEntry(argv[index]);
+      addArguments(index + 1);
+    }
   };
   const packageLauncher = isPackageLauncher(command);
   collect(command, packageLauncher);

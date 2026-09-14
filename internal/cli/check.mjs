@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { constants } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,11 +53,12 @@ function main() {
   runNode(["--test", ...tests]);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try {
+try {
+  // Stdin's '-' is not a file entry. Real file entries may use directory aliases.
+  if (process.argv[1] && process.argv[1] !== "-" && existsSync(process.argv[1]) && realpathSync.native(process.argv[1]) === realpathSync.native(fileURLToPath(import.meta.url))) {
     main();
-  } catch (error) {
-    console.error(error.message);
-    process.exitCode = 1;
   }
+} catch (error) {
+  console.error(error.message);
+  process.exitCode = 1;
 }

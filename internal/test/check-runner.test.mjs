@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -33,6 +33,14 @@ function run(root, args = []) {
   // Launch a fresh test runner; Node 24 otherwise inherits the outer test worker context.
   delete env.NODE_TEST_CONTEXT;
   return spawnSync(process.execPath, [join(root, "internal/cli/check.mjs"), ...args], { cwd: tmpdir(), encoding: "utf8", env });
+}
+
+function directoryAlias(root) {
+  const alias = join(root, "directory alias & $");
+  // Junctions exercise native Windows directory aliases without symlink privileges.
+  symlinkSync(root, alias, process.platform === "win32" ? "junction" : "dir");
+  assert.ok(lstatSync(alias).isSymbolicLink());
+  return alias;
 }
 
 test("check runner handles spaces and shell metacharacters while running both complete test groups", () => {
@@ -108,5 +116,77 @@ test("child exit codes, termination and launch errors cannot become a successful
     assert.equal(missing.status, 1);
     assert.match(missing.stderr, /ENOENT/);
     assert.doesNotMatch(missing.stdout, /incorrect continuation/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a real directory alias runs both suites and propagates syntax, test and usage failures", () => {
+  const root = fixture();
+  try {
+    const alias = directoryAlias(root);
+    let result = run(alias);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Checking syntax in 5 source files/);
+    assert.match(result.stdout, /Running 2 internal and board test files/);
+    for (const label of ["internal", "board"]) {
+      assert.equal(readFileSync(join(root, label + ".ran"), "utf8"), "ran");
+      assert.ok(result.stdout.includes(label + " coverage"));
+      rmSync(join(root, label + ".ran"));
+    }
+
+    const broken = join(root, "goalbuddy/surfaces/local-goal-board/scripts/lib/z invalid later.mjs");
+    writeFileSync(broken, "const invalid = ;\n");
+    result = run(alias);
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stderr, /z invalid later\.mjs/);
+    assert.match(result.stderr, /SyntaxError/);
+    for (const label of ["internal", "board"]) assert.equal(existsSync(join(root, label + ".ran")), false);
+
+    result = run(alias, ["--tests-only"]);
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.doesNotMatch(result.stdout, /Checking syntax/);
+    for (const label of ["internal", "board"]) {
+      assert.equal(readFileSync(join(root, label + ".ran"), "utf8"), "ran");
+      rmSync(join(root, label + ".ran"));
+    }
+    rmSync(broken);
+
+    writeFileSync(join(root, "internal/test/z failure.test.mjs"), 'import test from "node:test";\ntest("deliberate failure", () => { throw new Error("alias failure must propagate"); });\n');
+    result = run(alias);
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.match(result.stdout + result.stderr, /alias failure must propagate/);
+    for (const label of ["internal", "board"]) {
+      assert.equal(readFileSync(join(root, label + ".ran"), "utf8"), "ran");
+      rmSync(join(root, label + ".ran"));
+    }
+
+    result = run(alias, ["--unknown"]);
+    assert.equal(result.status, 2, result.stdout);
+    assert.match(result.stderr, /Usage: node internal\/cli\/check\.mjs \[--tests-only\]/);
+    assert.equal(result.stdout, "");
+    for (const label of ["internal", "board"]) assert.equal(existsSync(join(root, label + ".ran")), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("importing through a real directory alias does not run checks and keeps runNode usable", () => {
+  const root = fixture();
+  try {
+    const alias = directoryAlias(root);
+    const imported = `import { runNode } from ${JSON.stringify(pathToFileURL(join(alias, "internal/cli/check.mjs")).href)};\nrunNode(["-e", 'console.log("imported runNode works")']);\n`;
+    const wrapper = join(root, "importer & $.mjs");
+    writeFileSync(wrapper, imported);
+    // A file entry, eval with no entry, and stdin's non-file '-' entry must all
+    // import without invoking main or changing a successful process exit.
+    for (const { args, input } of [
+      { args: [wrapper, "--tests-only"] },
+      { args: ["--input-type=module", "-e", imported] },
+      { args: ["--input-type=module", "-e", imported, "goalbuddy-non-file-argument"] },
+      { args: ["--input-type=module", "-"], input: imported },
+    ]) {
+      const result = spawnSync(process.execPath, args, { cwd: tmpdir(), encoding: "utf8", input });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(result.stdout.trim(), "imported runNode works");
+      assert.equal(result.stderr, "");
+      for (const label of ["internal", "board"]) assert.equal(existsSync(join(root, label + ".ran")), false);
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

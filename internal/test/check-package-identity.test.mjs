@@ -2,42 +2,53 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { npmCliPath, spawnNpm } from "../cli/npm-command.mjs";
 
 const script = resolve("internal/cli/check-package-identity.mjs");
 
-test("package identity compares extracted file lists and SHA-256 hashes", () => {
-  const root = mkdtempSync(join(tmpdir(), "goalbuddy identity & shell; $test-"));
-  try {
-    writePackage(root, "tag content\n");
-    git(root, "init");
-    git(root, "add", "package.json", "payload.txt");
-    git(root, "-c", "user.name=GoalBuddy Tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "fixture");
-    git(root, "tag", "v1.0.0");
+for (const autocrlf of ["false", "true"]) {
+  test(`package identity compares extracted file lists and SHA-256 hashes (core.autocrlf=${autocrlf})`, () => {
+    const root = mkdtempSync(join(tmpdir(), "goalbuddy identity & shell; $test-"));
+    try {
+      writePackage(root, "tag content\n");
+      git(root, "init");
+      git(root, "config", "--local", "core.autocrlf", autocrlf);
+      // These fixtures promise exact bytes. Git archive otherwise applies the
+      // caller's text conversion and turns LF blobs into CRLF on Windows.
+      writeFileSync(join(root, ".gitattributes"), "package.json -text\npayload.txt -text\n");
+      git(root, "add", ".gitattributes", "package.json", "payload.txt");
+      git(root, "-c", "user.name=GoalBuddy Tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "fixture");
+      git(root, "tag", "v1.0.0");
 
-    const registry = join(root, "registry & literal; $spec");
-    mkdirSync(registry);
-    writePackage(registry, "tag content\n");
-    const matching = check(root, registry);
-    assert.equal(matching.status, 0, matching.stderr || matching.stdout);
-    assert.equal(JSON.parse(matching.stdout).ok, true);
+      const registry = join(root, "registry & literal; $spec");
+      mkdirSync(registry);
+      writePackage(registry, "tag content\n");
+      const matching = check(root, registry);
+      assert.equal(matching.status, 0, matching.stderr || matching.stdout);
+      assert.equal(JSON.parse(matching.stdout).ok, true);
 
-    writeFileSync(join(registry, "payload.txt"), "different registry content\n");
-    const mismatching = check(root, registry);
-    assert.equal(mismatching.status, 1, mismatching.stderr || mismatching.stdout);
-    const report = JSON.parse(mismatching.stdout);
-    assert.equal(report.ok, false);
-    assert.deepEqual(report.only_in_package, []);
-    assert.deepEqual(report.only_in_tag, []);
-    assert.equal(report.changed[0].path, "payload.txt");
-    assert.match(report.changed[0].package_sha256, /^[a-f0-9]{64}$/);
-    assert.match(report.changed[0].tag_sha256, /^[a-f0-9]{64}$/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      for (const payload of ["tag content\r\n", "different registry content\n"]) {
+        writeFileSync(join(registry, "payload.txt"), payload);
+        const mismatching = check(root, registry);
+        assert.equal(mismatching.status, 1, mismatching.stderr || mismatching.stdout);
+        const report = JSON.parse(mismatching.stdout);
+        assert.equal(report.ok, false);
+        assert.deepEqual(report.only_in_package, []);
+        assert.deepEqual(report.only_in_tag, []);
+        assert.deepEqual(report.changed, [{
+          path: "payload.txt",
+          package_sha256: createHash("sha256").update(payload).digest("hex"),
+          tag_sha256: createHash("sha256").update("tag content\n").digest("hex"),
+        }]);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("tarball manifest records every packaged file hash", () => {
   const root = mkdtempSync(join(tmpdir(), "goalbuddy-manifest-test-"));
