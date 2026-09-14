@@ -987,11 +987,10 @@ test("reset removes only GoalBuddy-owned Codex runtime surfaces", () => {
 
     const agentsRoot = join(codexHome, "agents");
     mkdirSync(agentsRoot, { recursive: true });
-    for (const file of ["goal_judge.toml", "goal_scout.toml", "other.toml"]) {
-      writeFileSync(join(agentsRoot, file), `${file}\n`);
+    for (const file of ["goal_judge.toml", "goal_scout.toml", "goal_worker.toml"]) {
+      writeFileSync(join(agentsRoot, file), readFileSync(join("goalbuddy", "agents", file)));
     }
-    mkdirSync(join(agentsRoot, "goal_worker.toml"), { recursive: true });
-    writeFileSync(join(agentsRoot, "goal_worker.toml", "sentinel.txt"), "corrupt agent path\n");
+    writeFileSync(join(agentsRoot, "other.toml"), "unrelated user agent\n");
 
     const staleSkill = join(codexHome, "skills", "goalbuddy");
     const staleAlias = join(codexHome, "skills", "goal-maker");

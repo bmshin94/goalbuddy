@@ -1470,7 +1470,23 @@ function installPlugin({ quiet = false } = {}) {
 
   let nativeReason = "";
   let nativeUsed = false;
-  const cli = runCodex(["--version"]);
+  let protectedCachePaths;
+  try {
+    protectedCachePaths = inspectCodexCache(pluginManifest.version);
+  } catch (error) {
+    const result = lifecycleResult({
+      ok: false,
+      target: "codex",
+      installModel: "none",
+      proof: proofResult(codexHome(), [proofCheck("cache-inspection", false, error.message)]),
+      error: { code: "CACHE_INSPECTION_FAILED", message: `Codex cache safety could not be proven; no installation attempted: ${error.message}` },
+    });
+    return finishCodexInstallReport(codexLegacyReport({ source, pluginManifest, pluginCachePath, result }), quiet);
+  }
+  if (protectedCachePaths.length) {
+    nativeReason = `Native Codex install skipped to preserve cache entries: ${protectedCachePaths.join(", ")}`;
+  }
+  const cli = protectedCachePaths.length ? { ok: false } : runCodex(["--version"]);
   if (cli.ok) {
     nativeUsed = true;
     const marketplace = runCodex(["plugin", "marketplace", "add", source]);
@@ -1504,7 +1520,7 @@ function installPlugin({ quiet = false } = {}) {
     nativeReason = installed.ok
       ? "Codex CLI returned success but exact installed state was not proven"
       : `Codex CLI installation failed: ${firstLine(installed.stderr || installed.stdout || marketplace.stderr || marketplace.stdout)}`;
-  } else {
+  } else if (!nativeReason) {
     nativeReason = "codex CLI unavailable";
   }
 
@@ -1567,6 +1583,14 @@ function finishCodexInstallReport(report, quiet) {
   }
   if (quiet) return report;
 
+  if (!report.result.ok) {
+    console.error(`${canonicalProductName} Codex installation failed (${report.result.error.code}): ${report.result.error.message}`);
+    console.error(`Codex home: ${report.codex_home}`);
+    console.error("Review the reported cause and existing files before retrying.");
+    process.exitCode = 1;
+    return report;
+  }
+
   console.log(`Installed ${canonicalProductName} Codex plugin ${report.version}`);
   console.log(`Marketplace: ${report.marketplace_source}`);
   console.log(`Cache: ${report.cache_path}`);
@@ -1584,7 +1608,6 @@ function finishCodexInstallReport(report, quiet) {
   console.log("");
   console.log("Goal surface:");
   console.log(`  npx ${canonicalCliName} board docs/goals/<slug>`);
-  if (!report.result.ok) process.exitCode = 1;
   return report;
 }
 
@@ -1667,6 +1690,32 @@ function resetCodex() {
     process.exitCode = 1;
     return report;
   }
+  // An agent name alone does not prove ownership after a user edits its contents.
+  // Refuse the whole reset before changing config or cache so recovery stays intact.
+  const preservedFiles = requiredAgentFiles
+    .map((file) => ({ path: join(codexHome(), "agents", file), source: join(skillSource, "agents", file) }))
+    .filter(({ path, source }) => existsSync(path) && !fileMatches(path, source))
+    .map(({ path }) => path);
+  if (preservedFiles.length) {
+    const proof = proofResult(codexHome(), preservedFiles.map((path) => proofCheck("agent-ownership", false, path)));
+    const report = {
+      reset: false,
+      target: "codex",
+      codex_home: codexHome(),
+      config_path: join(codexHome(), "config.toml"),
+      removed_config_sections: [],
+      removed_plugin_cache_paths: [],
+      removed_agents: [],
+      removed_legacy_skill_paths: [],
+      preserved_files: preservedFiles,
+      result: lifecycleResult({ ok: false, action: "reset", target: "codex", installModel: readCodexInstallModel(), proof, error: { code: "UNOWNED_FILE", message: "Codex reset preserved modified or unproven agents and made no changes. Review those files before retrying with the matching package version." } }),
+    };
+    if (hasFlag("--json")) printJson(report);
+    else console.error(report.result.error.message);
+    process.exitCode = 1;
+    return report;
+  }
+
   const configPath = join(codexHome(), "config.toml");
   const removedConfigSections = [];
   if (existsSync(configPath)) {
@@ -1921,6 +1970,33 @@ function removeTomlTable(text, header) {
 
   if (!removed) return text;
   return output.join("\n").replace(/\n{3,}/g, "\n\n").replace(/\n*$/, "\n");
+}
+
+// Inspect the native installer's sibling-removal boundary before permitting cache mutation.
+function inspectCodexCache(installedVersion) {
+  const versionsRoot = dirname(pluginCacheRoot(installedVersion));
+  // Reject redirected or non-directory cache ancestors before either installer can mutate them.
+  for (const path of [join(codexHome(), "plugins"), join(codexHome(), "plugins", "cache"), pluginCacheOwnerRoot(), versionsRoot]) {
+    let info;
+    try {
+      info = lstatSync(path);
+    } catch (error) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
+    if (!info.isDirectory()) throw new Error(`Cache path is not a directory: ${path}`);
+  }
+  const protectedPaths = [];
+  for (const entry of readdirSync(versionsRoot, { withFileTypes: true })) {
+    const path = join(versionsRoot, entry.name);
+    if (entry.name === installedVersion && !entry.isDirectory()) {
+      throw new Error(`Requested version path is not a directory: ${path}`);
+    }
+    // Native plugin add removes every sibling, including files and invalid version segments.
+    // The bundled path only prunes version-shaped directories and leaves these entries alone.
+    if (!entry.isDirectory() || !isPluginVersionSegment(entry.name)) protectedPaths.push(path);
+  }
+  return protectedPaths;
 }
 
 // Codex serves the highest version directory it finds under the plugin's cache root, so a directory

@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -276,5 +276,234 @@ test("Claude loose reset preserves every file when one file is modified", () => 
     assert.match(readFileSync(join(home, "skills", "goal-prep", "SKILL.md"), "utf8"), /name: goal-prep/);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("Codex reset preserves config, cache and agents when an agent is modified or unproven", () => {
+  const root = mkdtempSync(join(tmpdir(), "goalbuddy-codex-preserve-"));
+  try {
+    const home = join(root, "codex");
+    const env = missingCliEnv(root, "codex");
+    const installed = run(["install", "--target", "codex", "--codex-home", home], env);
+    assert.equal(installed.status, 0, installed.stderr || installed.stdout);
+    const config = join(home, "config.toml");
+    const cacheManifest = join(home, "plugins", "cache", "goalbuddy", "goalbuddy", version, ".codex-plugin", "plugin.json");
+    const configBefore = readFileSync(config);
+    const cacheBefore = readFileSync(cacheManifest);
+    const modified = join(home, "agents", "goal_worker.toml");
+    const original = readFileSync(modified);
+    for (const directory of [false, true]) {
+      if (directory) {
+        rmSync(modified);
+        mkdirSync(modified);
+        writeFileSync(join(modified, "user.txt"), "user content\n");
+      } else writeFileSync(modified, "user customization\n");
+      const reset = run(["reset", "--target", "codex", "--codex-home", home], env);
+      assert.equal(reset.status, 1);
+      assert.equal(reset.json.reset, false);
+      assert.equal(reset.json.result.error.code, "UNOWNED_FILE");
+      assert.deepEqual(reset.json.preserved_files, [modified]);
+      assert.deepEqual(reset.json.removed_agents, []);
+      assert.deepEqual(readFileSync(config), configBefore);
+      assert.deepEqual(readFileSync(cacheManifest), cacheBefore);
+      assert.equal(readFileSync(directory ? join(modified, "user.txt") : modified, "utf8"), directory ? "user content\n" : "user customization\n");
+    }
+    rmSync(modified, { recursive: true });
+    writeFileSync(modified, original);
+    assert.equal(run(["reset", "--target", "codex", "--codex-home", home], env).status, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+// Available native CLI model with the destructive sibling behavior observed in Codex 0.154.0.
+function destructiveCodexEnv(root) {
+  const bin = isolatedPath(root, "destructive-codex");
+  const script = join(bin, "codex.cjs");
+  const calls = join(root, "native-calls.jsonl");
+  writeFileSync(script, `
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
+if (args[0] === "--version") { console.log("codex-cli fixture available"); process.exit(0); }
+if (args[0] === "plugin" && args[1] === "add") {
+  const root = path.join(process.env.CODEX_HOME, "plugins", "cache", "goalbuddy", "goalbuddy");
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.cpSync(${JSON.stringify(join(packageRoot, "plugins", "goalbuddy"))}, path.join(root, ${JSON.stringify(version)}), { recursive: true });
+  fs.writeFileSync(path.join(process.env.CODEX_HOME, "config.toml"), '[plugins."goalbuddy@goalbuddy"]\\nenabled = true\\n');
+}
+`);
+  if (process.platform === "win32") {
+    writeFileSync(join(bin, "codex.cmd"), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  } else {
+    const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+    writeExecutable(join(bin, "codex"), ["#!/bin/sh", `exec ${quote(process.execPath)} ${quote(script)} "$@"`]);
+  }
+  return { env: { PATH: `${bin}${delimiter}${process.env.PATH}` }, calls, script };
+}
+
+function installedFileSnapshot(root) {
+  const files = {};
+  function walk(path) {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const item = join(path, entry.name);
+      files[item] = { mode: statSync(item).mode, bytes: entry.isFile() ? readFileSync(item).toString("hex") : null };
+      if (entry.isDirectory()) walk(item);
+    }
+  }
+  walk(root);
+  return files;
+}
+
+test("Codex cache conflicts explain failure without success instructions on every direct install route", () => {
+  const root = mkdtempSync(join(tmpdir(), "goalbuddy-human-failure-"));
+  try {
+    const home = join(root, "codex");
+    const conflict = join(home, "plugins", "cache", "goalbuddy", "goalbuddy", version);
+    mkdirSync(resolve(conflict, ".."), { recursive: true });
+    writeFileSync(conflict, "unrelated user file\n");
+    chmodSync(conflict, 0o640);
+    writeFileSync(join(home, "config.toml"), "# unrelated configuration\n");
+    const before = installedFileSnapshot(home);
+    for (const route of [[], ["install"], ["update"], ["plugin", "install"]]) {
+      const args = [...route, "--target", "codex", "--codex-home", home];
+      const human = runHuman(args, {});
+      assert.equal(human.status, 1);
+      assert.match(human.stderr, /Codex installation failed.*CACHE_INSPECTION_FAILED/);
+      assert.match(human.stderr, /Requested version path is not a directory/);
+      assert.ok(human.stderr.includes(conflict), "the cause must identify the conflicting user file");
+      assert.match(human.stderr, /before retrying/);
+      assert.doesNotMatch(human.stdout + human.stderr, /Installed GoalBuddy|Restart Codex|then use:|Goal surface:|\$goal-prep/);
+      assert.equal(human.stdout, "");
+      const json = run(args, {});
+      assert.equal(json.status, 1);
+      assert.equal(json.stderr, "", "human failure formatting must not leak into JSON output");
+      assert.equal(json.json.installed, false);
+      assert.equal(json.json.result.ok, false);
+      assert.equal(json.json.result.error.code, "CACHE_INSPECTION_FAILED");
+      assert.ok(human.stderr.includes(json.json.result.error.message));
+      assert.deepEqual(installedFileSnapshot(home), before);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("successful Codex human installation still reports its installed payload and next steps", () => {
+  const root = mkdtempSync(join(tmpdir(), "goalbuddy-human-success-"));
+  try {
+    const home = join(root, "codex");
+    const env = missingCliEnv(root, "codex");
+    for (const action of ["install", "update"]) {
+      const human = runHuman([action, "--target", "codex", "--codex-home", home], env);
+      assert.equal(human.status, 0, human.stderr);
+      assert.equal(human.stderr, "");
+      assert.ok(human.stdout.includes(`Installed GoalBuddy Codex plugin ${version}`));
+      assert.match(human.stdout, /Restart Codex, then use:\n  \$goal-prep/);
+      assert.match(human.stdout, /Goal surface:/);
+      assert.deepEqual(readFileSync(join(home, "plugins", "cache", "goalbuddy", "goalbuddy", version, "skills", "goal-prep", "SKILL.md")), readFileSync(join(packageRoot, "goalbuddy", "SKILL.md")));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("aggregate cache refusal stays quiet while a successful Claude target receives its own next steps", () => {
+  const root = mkdtempSync(join(tmpdir(), "goalbuddy-human-partial-"));
+  try {
+    const codex = join(root, "codex");
+    const claude = join(root, "claude");
+    const conflict = join(codex, "plugins", "cache", "goalbuddy", "goalbuddy", version);
+    mkdirSync(resolve(conflict, ".."), { recursive: true });
+    writeFileSync(conflict, "unrelated user file\n");
+    chmodSync(conflict, 0o640);
+    const before = installedFileSnapshot(codex);
+    const env = missingCliEnv(root, "claude");
+    assert.equal(run(["install", "--target", "claude", "--claude-home", claude], env).status, 0);
+    for (const route of [[], ["install"], ["update"]]) {
+      const args = [...route, "--codex-home", codex, "--claude-home", claude];
+      const human = runHuman(args, env);
+      assert.equal(human.status, 1);
+      assert.equal(human.stderr, "", "quiet Codex formatting belongs to the aggregate reporter");
+      assert.match(human.stdout, /Codex: not completed/);
+      assert.ok(human.stdout.includes(conflict));
+      assert.doesNotMatch(human.stdout, /Installed GoalBuddy Codex|Restart Codex|\$goal-prep/);
+      assert.match(human.stdout, /Restart Claude Code, then run: \/goal-prep/);
+      const json = run(args, env);
+      assert.equal(json.status, 1);
+      assert.equal(json.stderr, "");
+      assert.equal(json.json.ok, false);
+      assert.equal(json.json.codex.result.error.code, "CACHE_INSPECTION_FAILED");
+      assert.equal(json.json.claude.result.ok, true);
+      assert.deepEqual(json.json.errors.map(({ target }) => target), ["codex"]);
+      assert.deepEqual(installedFileSnapshot(codex), before);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("available native Codex cannot delete protected cache directories or sibling files", () => {
+  for (const kind of ["invalid-directory", "invalid-file", "valid-segment-file"]) {
+    const root = mkdtempSync(join(tmpdir(), "goalbuddy-cache-protection-"));
+    try {
+      const home = join(root, "codex");
+      assert.equal(run(["install", "--target", "codex", "--codex-home", home], missingCliEnv(root, "codex")).status, 0);
+      const native = destructiveCodexEnv(root);
+      assert.equal(spawnSync(process.execPath, [native.script, "--version"]).status, 0);
+      const versions = join(home, "plugins", "cache", "goalbuddy", "goalbuddy");
+      const kept = join(versions, kind === "valid-segment-file" ? "scratch" : "notes for me");
+      if (kind === "invalid-directory") mkdirSync(kept);
+      const sentinel = kind === "invalid-directory" ? join(kept, "user.txt") : kept;
+      writeFileSync(sentinel, "unrelated user bytes\n");
+      chmodSync(sentinel, 0o640);
+      const mode = statSync(sentinel).mode;
+      // These are valid directory segments, including the word scratch; they remain pruneable.
+      for (const stale of kind === "valid-segment-file" ? ["9.9.9"] : ["9.9.9", "scratch"]) {
+        mkdirSync(join(versions, stale));
+        writeFileSync(join(versions, stale, "stale.txt"), "old version\n");
+      }
+      writeFileSync(native.calls, "");
+      const response = run(["update", "--target", "codex", "--codex-home", home], native.env);
+      assert.equal(response.status, 0, response.stderr || response.stdout);
+      assertResult(response.json.result, { action: "update", target: "codex", model: "bundled-copy" });
+      assert.equal(response.json.result.fallback.used, true);
+      assert.match(response.json.result.fallback.reason, /skipped to preserve cache entries/);
+      assert.ok(response.json.result.fallback.reason.includes(kept));
+      assert.equal(readFileSync(native.calls, "utf8"), "", "native CLI must not be called before preservation is secured");
+      assert.equal(readFileSync(sentinel, "utf8"), "unrelated user bytes\n");
+      assert.equal(statSync(sentinel).mode, mode);
+      assert.equal(existsSync(join(versions, "9.9.9")), false);
+      if (kind !== "valid-segment-file") assert.equal(existsSync(join(versions, "scratch")), false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test("unproven Codex cache inspection fails before native or bundled mutation", () => {
+  for (const kind of ["version-file", "ancestor-file", "inspection-error"]) {
+    const root = mkdtempSync(join(tmpdir(), "goalbuddy-cache-inspection-"));
+    try {
+      const home = join(root, "codex");
+      assert.equal(run(["install", "--target", "codex", "--codex-home", home], missingCliEnv(root, "codex")).status, 0);
+      const versions = join(home, "plugins", "cache", "goalbuddy", "goalbuddy");
+      const native = destructiveCodexEnv(root);
+      assert.equal(spawnSync(process.execPath, [native.script, "--version"]).status, 0);
+      writeFileSync(native.calls, "");
+      const env = { ...native.env };
+      if (kind === "inspection-error") {
+        const preload = join(root, "inspection-error.cjs");
+        writeFileSync(preload, `const fs = require("node:fs"); const original = fs.readdirSync; fs.readdirSync = function(p, ...args) { if (p === ${JSON.stringify(versions)}) throw Object.assign(new Error("injected unreadable cache"), { code: "EACCES" }); return original.call(this, p, ...args); }; require("node:module").syncBuiltinESMExports();`);
+        env.NODE_OPTIONS = `--require ${JSON.stringify(preload)}`;
+      } else {
+        const blocked = kind === "version-file" ? join(versions, version) : versions;
+        rmSync(blocked, { recursive: true });
+        writeFileSync(blocked, "unproven user data\n");
+      }
+      const before = installedFileSnapshot(home);
+      const response = run(["update", "--target", "codex", "--codex-home", home], env);
+      assert.equal(response.status, 1, response.stderr || response.stdout);
+      assert.equal(response.json.installed, false);
+      assert.equal(response.json.result.error.code, "CACHE_INSPECTION_FAILED");
+      assert.equal(response.json.result.proof.checks[0].ok, false);
+      assert.equal(readFileSync(native.calls, "utf8"), "");
+      assert.deepEqual(installedFileSnapshot(home), before);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
