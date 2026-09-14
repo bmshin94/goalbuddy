@@ -25,3 +25,24 @@ test("npm publishing checks packaged content against the exact release tag", () 
   assert.match(workflow, /check-package-identity\.mjs --package "goalbuddy@\$package_version" --git-ref "\$RELEASE_TAG"/);
   assert.match(workflow, /for attempt in 1 2 3 4 5/);
 });
+
+
+test("candidate CI preserves Ubuntu checks and prepares Windows checks on both supported Node lines", () => {
+  const ci = readFileSync(".github/workflows/test.yml", "utf8");
+  assert.match(ci, /push:\s*\n\s+branches: \[main\]/);
+  assert.match(ci, /pull_request:/);
+  assert.match(ci, /permissions:\s*\n\s+contents: read/);
+  const ubuntu = ci.slice(ci.indexOf("  test:"), ci.indexOf("  windows:"));
+  const windows = ci.slice(ci.indexOf("  windows:"));
+  assert.match(ubuntu, /name: Node \$\{\{ matrix.node \}\}/);
+  assert.match(ubuntu, /runs-on: ubuntu-latest/);
+  assert.match(windows, /runs-on: windows-latest/);
+  for (const job of [ubuntu, windows]) {
+    assert.match(job, /node: \["18", "24"\]/);
+    assert.match(job, /uses: actions\/checkout@v6/);
+    assert.match(job, /uses: actions\/setup-node@v6/);
+    assert.match(job, /node-version: \$\{\{ matrix.node \}\}/);
+    assert.match(job, /run: npm run check/);
+  }
+  assert.doesNotMatch(ci, /secrets\.|workflow_dispatch:|continue-on-error:|contents: write/);
+});

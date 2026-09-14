@@ -26,3 +26,21 @@ jobs:
 
       - name: Run checks
         run: npm run check
+
+  windows:
+    name: Windows Node ${{ matrix.node }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        node: ["18", "24"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Run checks
+        run: npm run check
