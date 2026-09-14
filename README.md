@@ -81,6 +81,8 @@ For Codex, the canonical install is the native plugin plus bundled agents:
 
 The Codex plugin bundles `$goal-prep`; a clean Codex install should not need personal `~/.codex/skills/goalbuddy` or `~/.codex/skills/goal-maker` folders. Native Codex `/goal` is a separate OpenAI-gated feature. GoalBuddy prepares local boards and handoff prompts for it, but it does not enable or replace native `/goal`.
 
+Install and update inspect the Codex cache before invoking its native installer. Non-version sibling directories and sibling files select the verified bundled path, preserving their contents and modes. Unproven cache inspection fails before installation; ordinary caches retain native installation. The result reports why fallback was selected.
+
 To verify a Codex install:
 
 ```bash
@@ -93,7 +95,7 @@ To remove GoalBuddy-owned Codex runtime surfaces:
 npx goalbuddy reset --target codex
 ```
 
-Native `codex plugin remove goalbuddy@goalbuddy` only removes the native plugin surface. GoalBuddy also owns the `goal_*.toml` agent files it installed, its Codex plugin cache, its marketplace entry, and old personal skill folders from earlier installs. Use `goalbuddy reset --target codex` when you want those GoalBuddy-owned files removed too.
+Codex reset preserves modified or unproven agent files and returns a failure before changing configuration or cache. Review those files and use the package version matching the installed agents before retrying. Native `codex plugin remove goalbuddy@goalbuddy` only removes the native plugin surface. GoalBuddy also owns the `goal_*.toml` agent files it installed, its Codex plugin cache, its marketplace entry, and old personal skill folders from earlier installs. Use `goalbuddy reset --target codex` when you want those GoalBuddy-owned files removed too.
 
 ## Claude Code Install Model
 
@@ -107,6 +109,29 @@ npx goalbuddy reset --target claude
 Reset removes a native plugin through the Claude Code CLI. For loose installs, it removes only files whose contents still match GoalBuddy's bundled files; modified or unproven files are preserved and reported.
 
 Installer JSON remains backward compatible and now includes a `result` object for each requested target. Its `ok` value comes from final filesystem and configuration readback, so a CLI exit code or metadata record by itself is never reported as a completed install.
+
+## Upgrading to 0.5.0
+
+0.5.0 is an unreleased candidate; npm latest remains 0.4.3 until publication. After release, use `npx goalbuddy@0.5.0 update --target codex` or `npx goalbuddy@0.5.0 update --target claude`, then restart the client and run the matching `doctor` command. An older marketplace copy can trigger a verified bundled Codex fallback. Claude falls back to loose files only when partial plugin state is proven absent; otherwise installation fails with the remaining state reported. Read `result.ok`, `fallback`, `warnings` and `error`; a partial or failed target makes the command fail even if the other target succeeds.
+
+Completion now requires observed evidence for the original outcome. Preserve historical receipts and verification attempts. If a final audit was already finalized, authorize a fresh final-audit task; do not edit old proof to make it pass. On the active audit, declare the exact check and every additional local dependency it needs, for example:
+
+```yaml
+acceptance:
+  command: ["node", "test/acceptance.mjs"]
+  artifacts: ["src"]
+  inputs: ["test/helpers.mjs", "config/test.json"]
+```
+
+Paths must exist in the authorized workspace. With `<skill-path>` pointing to the installed `goal-prep` skill, run the declared argv once:
+
+```bash
+node <skill-path>/scripts/record-acceptance.mjs docs/goals/<slug> -- node test/acceptance.mjs
+```
+
+Use the returned `acceptance_proof` and `acceptance_sha256` in the final receipt, then apply it through `goalbuddy receipt`; the stop check consumes that observation without rerunning the validator. A failed observation leaves the outcome incomplete. Repair the cause and obtain fresh evidence under the audit contract. `node .`, `node checks/` and shell composition are not concrete validators: name the actual file, and declare its imports/configuration in `inputs`.
+
+The recorder binds local files and declared inputs and displays exclusions. It cannot infer every dependency, observe all external state, or decide whether a passing test satisfies the person's intent. See the [execution contract](goalbuddy/references/goal-execution.md#one-observed-final-verification) for authorization, receipt fields and recovery.
 
 ## What It Creates
 
