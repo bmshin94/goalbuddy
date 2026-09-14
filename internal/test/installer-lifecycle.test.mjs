@@ -4,6 +4,7 @@ import { delimiter, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { writeCliFixture } from "./helpers/installer-cli-fixture.mjs";
 
 const cli = resolve("internal/cli/goal-maker.mjs");
 const packageRoot = resolve(".");
@@ -27,11 +28,6 @@ function runHuman(args, env) {
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
-function writeExecutable(path, lines) {
-  writeFileSync(path, `${lines.join("\n")}\n`);
-  chmodSync(path, 0o755);
-}
-
 function isolatedPath(root, kind) {
   const bin = join(root, `bin-${kind}`);
   mkdirSync(bin, { recursive: true });
@@ -40,50 +36,77 @@ function isolatedPath(root, kind) {
 
 function missingCliEnv(root, name) {
   const bin = isolatedPath(root, `missing-${name}`);
-  writeExecutable(join(bin, name), ["#!/bin/sh", "exit 127"]);
+  writeCliFixture(bin, name, "process.exit(127);");
   return { PATH: `${bin}${delimiter}${process.env.PATH}` };
+}
+
+function fixturePrelude(root, name, homeVariable) {
+  return `
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(join(root, `${name}-calls.jsonl`))}, JSON.stringify(args) + "\\n");
+const home = process.env[${JSON.stringify(homeVariable)}];
+const relative = home && path.relative(${JSON.stringify(root)}, home);
+if (!home || path.isAbsolute(relative) || relative === ".." || relative.startsWith(".." + path.sep)) {
+  throw new Error("Fixture must operate inside its task-owned home");
+}
+const target = path.join(home, "plugins", "cache", "goalbuddy", "goalbuddy", ${JSON.stringify(version)});
+`;
 }
 
 function nativeCodexEnv(root) {
   const bin = isolatedPath(root, "codex");
-  const pluginSource = join(packageRoot, "plugins", "goalbuddy");
-  writeExecutable(join(bin, "codex"), [
-    "#!/bin/sh",
-    "if [ \"$1\" = \"--version\" ]; then echo 'codex-cli test'; exit 0; fi",
-    "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"marketplace\" ]; then exit 0; fi",
-    "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"add\" ]; then",
-    `  target="$CODEX_HOME/plugins/cache/goalbuddy/goalbuddy/${version}"`,
-    "  mkdir -p \"$(dirname \"$target\")\"",
-    `  cp -R ${JSON.stringify(`${pluginSource}/.`)} "$target"`,
-    "  printf '[plugins.\"goalbuddy@goalbuddy\"]\\nenabled = true\\n' > \"$CODEX_HOME/config.toml\"",
-    "  exit 0",
-    "fi",
-    "if [ \"$1\" = \"login\" ]; then echo 'Logged in'; exit 0; fi",
-    "if [ \"$1\" = \"features\" ]; then echo 'goals  test  true'; exit 0; fi",
-    "exit 2",
-  ]);
+  writeCliFixture(bin, "codex", fixturePrelude(root, "codex", "CODEX_HOME") + `
+if (args[0] === "--version") { console.log("codex-cli test"); process.exit(0); }
+if (args[0] === "plugin" && args[1] === "marketplace") process.exit(0);
+if (args[0] === "plugin" && args[1] === "add") {
+  fs.cpSync(${JSON.stringify(join(packageRoot, "plugins", "goalbuddy"))}, target, { recursive: true });
+  fs.writeFileSync(path.join(home, "config.toml"), '[plugins."goalbuddy@goalbuddy"]\\nenabled = true\\n');
+  process.exit(0);
+}
+if (args[0] === "login") { console.log("Logged in"); process.exit(0); }
+if (args[0] === "features") { console.log("goals  test  true"); process.exit(0); }
+process.exit(2);
+`);
   return { PATH: `${bin}${delimiter}${process.env.PATH}` };
 }
 
 function nativeClaudeEnv(root) {
   const bin = isolatedPath(root, "claude");
-  const pluginSource = join(packageRoot, "plugins", "goalbuddy");
-  writeExecutable(join(bin, "claude"), [
-    "#!/bin/sh",
-    "if [ \"$1\" = \"--version\" ]; then echo 'Claude Code test'; exit 0; fi",
-    "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"marketplace\" ] && [ \"$3\" = \"remove\" ]; then printf '{}\\n' > \"$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json\"; exit 0; fi",
-    "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"marketplace\" ]; then mkdir -p \"$CLAUDE_CONFIG_DIR/plugins\"; exit 0; fi",
-    "if [ \"$1\" = \"plugin\" ] && { [ \"$2\" = \"install\" ] || [ \"$2\" = \"update\" ]; }; then",
-    `  target="$CLAUDE_CONFIG_DIR/plugins/cache/goalbuddy/goalbuddy/${version}"`,
-    "  mkdir -p \"$(dirname \"$target\")\"",
-    `  cp -R ${JSON.stringify(`${pluginSource}/.`)} "$target"`,
-    `  printf '{"plugins":{"goalbuddy@goalbuddy":[{"scope":"user","installPath":"%s","version":"${version}"}]}}\\n' "$target" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"`,
-    "  exit 0",
-    "fi",
-    `if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"uninstall\" ]; then rm -rf "$CLAUDE_CONFIG_DIR/plugins/cache/goalbuddy/goalbuddy/${version}"; printf '{\"plugins\":{}}\\n' > \"$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json\"; exit 0; fi`,
-    "exit 2",
-  ]);
+  writeCliFixture(bin, "claude", fixturePrelude(root, "claude", "CLAUDE_CONFIG_DIR") + `
+if (args[0] === "--version") { console.log("Claude Code test"); process.exit(0); }
+if (args[0] === "plugin" && args[1] === "marketplace") {
+  fs.mkdirSync(path.join(home, "plugins"), { recursive: true });
+  if (args[2] === "remove") fs.writeFileSync(path.join(home, "plugins", "known_marketplaces.json"), "{}\\n");
+  process.exit(0);
+}
+if (args[0] === "plugin" && ["install", "update"].includes(args[1])) {
+  fs.cpSync(${JSON.stringify(join(packageRoot, "plugins", "goalbuddy"))}, target, { recursive: true });
+  fs.writeFileSync(path.join(home, "plugins", "installed_plugins.json"), JSON.stringify({
+    plugins: { "goalbuddy@goalbuddy": [{ scope: "user", installPath: target, version: ${JSON.stringify(version)} }] }
+  }));
+  process.exit(0);
+}
+if (args[0] === "plugin" && args[1] === "uninstall") {
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.writeFileSync(path.join(home, "plugins", "installed_plugins.json"), JSON.stringify({ plugins: {} }));
+  process.exit(0);
+}
+process.exit(2);
+`);
   return { PATH: `${bin}${delimiter}${process.env.PATH}` };
+}
+
+function fixtureCalls(root, name) {
+  return readFileSync(join(root, `${name}-calls.jsonl`), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+}
+
+function assertNativePayload(home) {
+  const installed = join(home, "plugins", "cache", "goalbuddy", "goalbuddy", version);
+  for (const relative of [".codex-plugin/plugin.json", ".claude-plugin/plugin.json", "skills/goal-prep/SKILL.md"]) {
+    assert.deepEqual(readFileSync(join(installed, relative)), readFileSync(join(packageRoot, "plugins", "goalbuddy", relative)));
+  }
 }
 
 function assertResult(result, { action, target, model, ok = true }) {
@@ -101,12 +124,14 @@ function assertResult(result, { action, target, model, ok = true }) {
 test("Codex native lifecycle proves install, update, doctor, reset, and removed state", () => {
   const root = mkdtempSync(join(tmpdir(), "goalbuddy-codex-native-"));
   try {
-    const home = join(root, "codex");
+    const home = join(root, "codex home");
     const env = nativeCodexEnv(root);
     for (const action of ["install", "update"]) {
       const response = run([action, "--target", "codex", "--codex-home", home, "--source", packageRoot], env);
       assert.equal(response.status, 0, response.stderr || response.stdout);
       assertResult(response.json.result, { action, target: "codex", model: "codex-cli" });
+      assert.equal(response.json.result.fallback.used, false);
+      assertNativePayload(home);
     }
     const doctor = run(["doctor", "--target", "codex", "--codex-home", home], env);
     assert.equal(doctor.status, 0, doctor.stderr || doctor.stdout);
@@ -114,6 +139,8 @@ test("Codex native lifecycle proves install, update, doctor, reset, and removed 
     const reset = run(["reset", "--target", "codex", "--codex-home", home], env);
     assert.equal(reset.status, 0, reset.stderr || reset.stdout);
     assertResult(reset.json.result, { action: "reset", target: "codex", model: "none" });
+    assert.equal(existsSync(join(home, "plugins", "cache", "goalbuddy", "goalbuddy", version)), false);
+    assert.equal(fixtureCalls(root, "codex").filter((args) => args[0] === "plugin" && args[1] === "add").length, 2);
     assert.equal(run(["doctor", "--target", "codex", "--codex-home", home], env).status, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -142,12 +169,14 @@ test("Codex missing CLI uses and proves the atomic bundled-copy lifecycle", () =
 test("Claude native plugin lifecycle is exact and repeatable", () => {
   const root = mkdtempSync(join(tmpdir(), "goalbuddy-claude-native-"));
   try {
-    const home = join(root, "claude");
+    const home = join(root, "claude home");
     const env = nativeClaudeEnv(root);
     for (const action of ["install", "update"]) {
       const response = run([action, "--target", "claude", "--claude-home", home, "--source", packageRoot], env);
       assert.equal(response.status, 0, response.stderr || response.stdout);
       assertResult(response.json.result, { action, target: "claude", model: "claude-cli" });
+      assert.equal(response.json.result.fallback.used, false);
+      assertNativePayload(home);
     }
     const doctor = run(["doctor", "--target", "claude", "--claude-home", home], env);
     assert.equal(doctor.status, 0, doctor.stderr || doctor.stdout);
@@ -155,6 +184,10 @@ test("Claude native plugin lifecycle is exact and repeatable", () => {
     const reset = run(["reset", "--target", "claude", "--claude-home", home], env);
     assert.equal(reset.status, 0, reset.stderr || reset.stdout);
     assertResult(reset.json.result, { action: "reset", target: "claude", model: "none" });
+    assert.equal(existsSync(join(home, "plugins", "cache", "goalbuddy", "goalbuddy", version)), false);
+    for (const action of ["install", "update", "uninstall"]) {
+      assert.ok(fixtureCalls(root, "claude").some((args) => args[0] === "plugin" && args[1] === action));
+    }
     assert.equal(run(["doctor", "--target", "claude", "--claude-home", home], env).status, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -249,13 +282,14 @@ test("Claude zero-exit native install without state falls back only after absenc
   const root = mkdtempSync(join(tmpdir(), "goalbuddy-claude-unproven-"));
   try {
     const bin = isolatedPath(root, "claude-zero");
-    writeExecutable(join(bin, "claude"), ["#!/bin/sh", "exit 0"]);
+    writeCliFixture(bin, "claude", fixturePrelude(root, "claude", "CLAUDE_CONFIG_DIR") + "process.exit(0);");
     const home = join(root, "claude");
     const response = run(["install", "--target", "claude", "--claude-home", home], { PATH: `${bin}${delimiter}${process.env.PATH}` });
     assert.equal(response.status, 0, response.stderr || response.stdout);
     assertResult(response.json.result, { action: "install", target: "claude", model: "loose-files" });
     assert.equal(response.json.result.fallback.used, true);
     assert.match(response.json.result.fallback.reason, /not proven/i);
+    assert.ok(fixtureCalls(root, "claude").some((args) => args[0] === "plugin" && args[1] === "install"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -321,9 +355,8 @@ test("Codex reset preserves config, cache and agents when an agent is modified o
 // Available native CLI model with the destructive sibling behavior observed in Codex 0.154.0.
 function destructiveCodexEnv(root) {
   const bin = isolatedPath(root, "destructive-codex");
-  const script = join(bin, "codex.cjs");
   const calls = join(root, "native-calls.jsonl");
-  writeFileSync(script, `
+  const script = writeCliFixture(bin, "codex", `
 const fs = require("node:fs");
 const path = require("node:path");
 const args = process.argv.slice(2);
@@ -336,12 +369,6 @@ if (args[0] === "plugin" && args[1] === "add") {
   fs.writeFileSync(path.join(process.env.CODEX_HOME, "config.toml"), '[plugins."goalbuddy@goalbuddy"]\\nenabled = true\\n');
 }
 `);
-  if (process.platform === "win32") {
-    writeFileSync(join(bin, "codex.cmd"), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
-  } else {
-    const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
-    writeExecutable(join(bin, "codex"), ["#!/bin/sh", `exec ${quote(process.execPath)} ${quote(script)} "$@"`]);
-  }
   return { env: { PATH: `${bin}${delimiter}${process.env.PATH}` }, calls, script };
 }
 

@@ -4,6 +4,7 @@ import { delimiter, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 const cli = resolve("internal/cli/goal-maker.mjs");
 const packageVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
@@ -1467,7 +1468,10 @@ test("install removes an old GoalBuddy-owned /goal command", () => {
     const legacyCommand = join(claudeHome, "commands", "goal.md");
     mkdirSync(join(claudeHome, "commands"), { recursive: true });
     const legacyBody = readFileSync("plugins/goalbuddy/commands/goalbuddy.md", "utf8")
+      // Reconstruct the exact published LF artifact, independent of checkout EOLs.
+      .replaceAll("\r\n", "\n")
       .replace("Run the GoalBuddy execution loop.\n", "Run the GoalBuddy `/goal` execution loop.\n");
+    assert.equal(createHash("sha256").update(legacyBody).digest("hex"), "586a0839302239858cce64f954666e8690c5ddef036e397adfd9456eed4738e2");
     writeFileSync(legacyCommand, legacyBody);
 
     const result = runGoalMaker(["install", "--target", "claude", "--claude-home", claudeHome, "--json"]);

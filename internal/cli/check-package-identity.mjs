@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
+import { spawnNpm } from "./npm-command.mjs";
 
 try {
   main();
@@ -87,8 +88,12 @@ function writeManifest(path, manifest) {
 }
 
 function run(command, commandArgs, cwd) {
-  const result = spawnSync(command, commandArgs, { cwd, encoding: "utf8" });
-  if (result.status !== 0) fail(`${command} ${commandArgs.join(" ")} failed:\n${result.stderr || result.stdout}`);
+  const options = { cwd, encoding: "utf8", shell: false };
+  const result = command === "npm" ? spawnNpm(commandArgs, options) : spawnSync(command, commandArgs, options);
+  if (result.status !== 0) {
+    const cause = result.error?.message || result.stderr || result.stdout || `signal ${result.signal || "unknown"}`;
+    fail(`${command} ${commandArgs.join(" ")} failed (status ${result.status}):\n${cause}`);
+  }
   return result;
 }
 
